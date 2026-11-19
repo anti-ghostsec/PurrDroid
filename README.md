@@ -156,8 +156,13 @@ terminal needed:
 4. While Android runs: drop APKs on PurrDroid's window to install them, and
    any other file or text to send it to an app in Android.
 
-In BlissOS's installer: create one partition on the disk (`vda`), format it
-ext4, say yes to GRUB, and reboot. When Android has started, switch the
+In BlissOS's installer (PurrDroid shows these steps when you press
+Install): pick **Installation** in its first menu (on its own it starts
+Live CD after a minute, which installs nothing); pick `vda1`, which
+PurrDroid has already made, then ext4; and answer **Yes** to "Install Grub2
+bootloader?", whose default is Skip: without it nothing can start Android.
+Then Reboot. If the boot loader was skipped all the same, PurrDroid sees
+the disk can't start and opens the installer again, saying what to pick. When Android has started, switch the
 bridge on once: **Settings → About → tap Build number 7 times**, then
 **Settings → System → Developer options → USB debugging**, and tap **Allow**
 when Android asks about PurrDroid's key. (The emulator engine needs none of

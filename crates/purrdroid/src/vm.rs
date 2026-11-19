@@ -33,6 +33,8 @@ pub struct Config {
     pub net: Net,
     pub adb_port: u16,
     pub install: bool,
+    /// While installing: the disk before the ISO (see main's `disk_first`).
+    pub disk_first: bool,
     pub mac: String,
     pub serial: String,
     pub uuid: String,
@@ -94,10 +96,11 @@ pub fn command(c: &Config) -> Command {
     // Disks, from PurrDroid's NBD server.
     let disk = s.disk.display().to_string();
     q.arg("-blockdev").arg(format!("driver=nbd,node-name=android,server.type=unix,server.path={disk},export=android,discard=unmap"));
-    q.arg("-device").arg(format!("virtio-blk-pci,drive=android,bootindex={}", if c.install { 1 } else { 0 }));
+    let (disk_at, iso_at) = if c.install && !c.disk_first { (1, 0) } else { (0, 1) };
+    q.arg("-device").arg(format!("virtio-blk-pci,drive=android,bootindex={disk_at}"));
     if c.install {
         q.arg("-blockdev").arg(format!("driver=nbd,node-name=media,server.type=unix,server.path={disk},export=media,read-only=on"));
-        a(&mut q, &["-device", "ide-cd,drive=media,bootindex=0"]);
+        q.arg("-device").arg(format!("ide-cd,drive=media,bootindex={iso_at}"));
     }
 
     // Screen, pointer, keyboard.

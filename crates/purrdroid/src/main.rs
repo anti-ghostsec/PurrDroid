@@ -281,7 +281,7 @@ fn cmd_init(args: &[String]) -> Res<()> {
         if fill {
             println!("Writing all {gib} GiB once, so the disk has no holes...");
         }
-        Disk::create(&f.android, &key, sectors, fill)?;
+        prepare_disk(&mut Disk::create(&f.android, &key, sectors, fill)?)?;
         println!("Made a {gib} GiB disk for Android ({}).", f.android.display());
         println!("Next: `purrdroid import android.iso`, then `purrdroid install`.");
         return Ok(());
@@ -513,6 +513,28 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
     } else {
         exports.insert("android".to_string(), Arc::new(Mutex::new(Disk::open(&files.android, &android_key, false)?)));
     }
+    // Installed, but with nothing to start it: the installer's boot loader
+    // step was skipped (its default), so the disk's first sector has no
+    // code and the virtual PC spins on it forever. The installer again,
+    // with what to pick, instead of that.
+    let mut install = install;
+    let mut first = [0u8; 512];
+    let readable = exports["android"].lock().unwrap().read_at(0, &mut first).is_ok();
+    // A disk PurrDroid prepared, nothing installed on it yet: tried first,
+    // it hands over to the ISO, and once a boot loader is on it the
+    // installer's own Reboot starts the installed Android.
+    let disk_first = readable && first[..440] == blank_boot_code();
+    if !install && v.settings.get("media_key").is_some() && files.media.exists() {
+        if readable && first[510..512] == [0x55, 0xAA] && (first[..440].iter().all(|&b| b == 0) || first[..440] == blank_boot_code()) {
+            let how = "Android is on its disk, but nothing on the disk can start it: the installer's \"Install Grub2 bootloader?\" was answered Skip (its default), so the PC stops at \"Booting from Hard Disk\".\n\nPurrDroid opens Bliss's installer again now. In it:\n1. Installation - Install BlissOS to harddisk.\n2. Pick vda1, then \"Do not re-format\".\n3. Answer Yes to installing Grub2 (and Yes if it offers to convert GPT to MBR).\n4. When it's done, close PurrDroid's window and open PurrDroid again.";
+            if GUI.load(Ordering::Relaxed) {
+                gui::message("PurrDroid: Android needs its boot loader", how)?;
+            } else {
+                eprintln!("purrdroid: {}", how.replace("\n\n", " ").replace('\n', " "));
+            }
+            install = true;
+        }
+    }
     if install {
         let key = v.settings.key("media_key").ok_or("no ISO for this password yet: `purrdroid import FILE.iso` first")?;
         let media =
@@ -546,6 +568,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         net,
         adb_port: vm::free_port()?,
         install,
+        disk_first,
         mac: v.settings.get("mac").unwrap_or("02:00:00:00:00:01").to_string(),
         serial: v.settings.get("serial").unwrap_or("0").to_string(),
         uuid: v.settings.get("uuid").unwrap_or("00000000-0000-4000-8000-000000000000").to_string(),
@@ -1168,7 +1191,7 @@ fn gui_main() -> Res<()> {
             panel::Engine::Iso => {
                 let key = v.settings.new_key("android_key")?;
                 v.settings.set("disk", "plain");
-                Disk::create(&f.android, &key, 32 * (1 << 30) / purrdroid_store::disk::SECTOR as u64, false)?;
+                prepare_disk(&mut Disk::create(&f.android, &key, 32 * (1 << 30) / purrdroid_store::disk::SECTOR as u64, false)?)?;
             }
         }
         v.save()?;
@@ -1188,6 +1211,9 @@ fn gui_main() -> Res<()> {
             match panel::get_android(has_iso, installed, &mut import)? {
                 panel::Next::Quit => return Ok(()),
                 panel::Next::Install => {
+                    // The installer's own defaults skip its boot loader: what to
+                    // pick, in a box, before it opens.
+                    gui::message("PurrDroid: installing Android", INSTALL_STEPS)?;
                     // Back here afterwards, to start it once it's installed.
                     run_unlocked(&[], &mut v, true)?;
                 }
@@ -1200,6 +1226,45 @@ fn gui_main() -> Res<()> {
         }
     }
     run_unlocked(&[], &mut v, false)
+}
+
+/// What to pick in BlissOS's installer. Two of its defaults (Live CD
+/// after a minute, and Skip for the boot loader) leave nothing on the disk
+/// that starts Android.
+const INSTALL_STEPS: &str = "In BlissOS's installer:\n1. In its first menu, pick Installation - Install BlissOS to harddisk (within a minute: on its own it starts Live CD, which installs nothing).\n2. Pick vda1 (PurrDroid has made it), then ext4, then Yes.\n3. OTA update: No.\n4. \"Do you want to install Grub2 bootloader?\": Yes. Its default is Skip, and with that Android can't start.\n5. Reboot. Bliss starts from the disk; close the window when you like, and start it from PurrDroid after.";
+
+/// The boot code of a disk PurrDroid prepared: "try the next disk" (int
+/// 0x18), so a disk nothing was installed on starts the ISO instead.
+fn blank_boot_code() -> [u8; 440] {
+    let mut code = [0u8; 440];
+    code[..2].copy_from_slice(&[0xCD, 0x18]);
+    code
+}
+
+/// A new Android disk, made ready for an ISO's installer: an MBR ("dos")
+/// partition table with one bootable Linux partition over all of it. The
+/// installer then offers vda1 straight away, and never a GPT disk, on
+/// which it can't put its boot loader.
+fn prepare_disk(d: &mut Disk) -> Res<()> {
+    let sectors = (d.len() / 512).min(u64::from(u32::MAX));
+    let mut mbr = [0u8; 512];
+    mbr[..440].copy_from_slice(&blank_boot_code());
+    let mut id = [0u8; 4];
+    vaultkit::random_bytes(&mut id)?;
+    mbr[440..444].copy_from_slice(&id);
+    // The partition: bootable, LBA only (CHS fields "beyond the end"), type
+    // 0x83, from sector 2048 to the end.
+    let p = &mut mbr[446..462];
+    p[0] = 0x80;
+    p[1..4].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+    p[4] = 0x83;
+    p[5..8].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+    p[8..12].copy_from_slice(&2048u32.to_le_bytes());
+    p[12..16].copy_from_slice(&((sectors - 2048) as u32).to_le_bytes());
+    mbr[510..512].copy_from_slice(&[0x55, 0xAA]);
+    d.write_at(0, &mbr)?;
+    d.flush()?;
+    Ok(())
 }
 
 fn cmd_apk(args: &[String]) -> Res<()> {
