@@ -721,7 +721,7 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
     // the PC, which has nothing to fall back on without swap. 2 GiB is
     // plenty for Android unless asked for more.
     const EMU_EXTRA_MB: u64 = 2048;
-    const PC_KEEP_MB: u64 = 1536;
+    const PC_KEEP_MB: u64 = 1024;
     let asked = flag_value(args, "--ram").is_some() || v.settings.get("ram_mb").is_some();
     let mut ram = if asked { ram } else { 2048 };
     let free = mem_available_mb();
@@ -884,6 +884,25 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
                     }
                     let _ = fs::write(&out, ppm);
                     drop(f);
+                    // Input to try, for testing it: PURRDROID_INPUT_TEST=FILE, a
+                    // line each: "press EVDEV", "wheel UP|DOWN X Y", "click X Y"
+                    // (in the frames' pixels). The file is emptied once done.
+                    if let Some(cmds) = std::env::var_os("PURRDROID_INPUT_TEST").map(PathBuf::from) {
+                        let todo = fs::read_to_string(&cmds).unwrap_or_default();
+                        let _ = fs::write(&cmds, "");
+                        for l in todo.lines() {
+                            let w: Vec<&str> = l.split_whitespace().collect();
+                            let n = |i: usize| w.get(i).and_then(|v| v.parse::<u16>().ok()).unwrap_or(0);
+                            let r = match w.first().copied() {
+                                Some("press") => input.press(u32::from(n(1))),
+                                Some("wheel") => input.pointer(if w.get(1) == Some(&"UP") { 8 } else { 16 }, n(2), n(3)),
+                                Some("click") => input.pointer(1, n(1), n(2)).and_then(|()| input.pointer(0, n(1), n(2))),
+                                _ => Ok(()),
+                            };
+                            eprintln!("purrdroid: input test: {l}: {r:?}");
+                        }
+                        continue;
+                    }
                     // Move the pointer, to make frames.
                     let _ = input.pointer(0, (100 + round * 37 % 300) as u16, 300);
                 }

@@ -222,7 +222,7 @@ window.
   apps go in), and `--data GiB` (default 4) sets its partition's size.
 - Memory, all of it from the PC's RAM: Android gets 2 GiB (`--ram MB` for
   more), and the emulator and its folder take about 2 GiB on top. PurrDroid
-  starts only if 1.5 GiB would still be left for everything else (with
+  starts only if 1 GiB would still be left for everything else (with
   less, Android gets 1.5 GiB), and shuts Android down if the PC gets down
   to 400 MiB free. Without swap a PC that runs out freezes, so it's the
   emulator the kernel stops first if it comes to that.

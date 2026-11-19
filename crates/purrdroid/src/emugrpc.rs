@@ -514,11 +514,33 @@ impl Input {
         let dx = x as i64 * self.device.0 as i64 / fw;
         let dy = y as i64 * self.device.1 as i64 / fh;
         if buttons & 0b11000 != 0 {
-            let mut w = Vec::new();
-            field_int(&mut w, 2, if buttons & 8 != 0 { 120 } else { -120 });
-            let mut ev = Vec::new();
-            field_bytes(&mut ev, 6, &w);
-            return self.send(ev);
+            // The emulator gives Android touchscreens but no mouse, so the
+            // wheel goes nowhere as a wheel: each notch is a short slow drag
+            // instead (up the screen to go down the page), slow enough not
+            // to fling. Not while a button is held.
+            if buttons & 0b101 != 0 {
+                return Ok(());
+            }
+            let step = (self.device.1 as i64 / 7).max(80);
+            let dir = if buttons & 8 != 0 { 1 } else { -1 };
+            let drag = |m: i64, y: i64| {
+                let mut e = Vec::new();
+                field_int(&mut e, 1, dx);
+                field_int(&mut e, 2, y.clamp(0, self.device.1 as i64 - 1));
+                field_int(&mut e, 3, m);
+                let mut ev = Vec::new();
+                field_bytes(&mut ev, 3, &e);
+                self.send(ev)
+            };
+            drag(1, dy)?;
+            for i in 1..=10 {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                drag(1, dy + dir * step * i / 10)?;
+            }
+            // Held still a moment at the end: a drag, not a fling.
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drag(1, dy + dir * step)?;
+            return drag(0, dy + dir * step);
         }
         let mut m = Vec::new();
         field_int(&mut m, 1, dx);

@@ -56,6 +56,9 @@ impl Sink for crate::emugrpc::Input {
         let _ = crate::emugrpc::Input::pointer(self, buttons, x, y);
     }
     fn press(&self, evdev: u32) {
+        // The emulator's keyboard has Home on KEY_HOME (102), as its own
+        // Home button sends it; KEY_HOMEPAGE (172) does nothing there.
+        let evdev = if evdev == 172 { 102 } else { evdev };
         let _ = crate::emugrpc::Input::press(self, evdev);
     }
 }
