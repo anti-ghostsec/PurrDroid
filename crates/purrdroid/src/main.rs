@@ -523,16 +523,27 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
     // A disk PurrDroid prepared, nothing installed on it yet: tried first,
     // it hands over to the ISO, and once a boot loader is on it the
     // installer's own Reboot starts the installed Android.
-    let disk_first = readable && first[..440] == blank_boot_code();
+    let mut disk_first = readable && first[..440] == blank_boot_code();
     if !install && v.settings.get("media_key").is_some() && files.media.exists() {
         if readable && first[510..512] == [0x55, 0xAA] && (first[..440].iter().all(|&b| b == 0) || first[..440] == blank_boot_code()) {
-            let how = "Android is on its disk, but nothing on the disk can start it: the installer's \"Install Grub2 bootloader?\" was answered Skip (its default), so the PC stops at \"Booting from Hard Disk\".\n\nPurrDroid opens Bliss's installer again now. In it:\n1. Installation - Install BlissOS to harddisk.\n2. Pick vda1, then \"Do not re-format\".\n3. Answer Yes to installing Grub2 (and Yes if it offers to convert GPT to MBR).\n4. When it's done, close PurrDroid's window and open PurrDroid again.";
+            // On a GPT disk the installer can't put its boot loader (it asks
+            // to convert, and its default is No): made MBR here first, the
+            // partitions where they are.
+            let converted = gpt_to_mbr(&mut *exports["android"].lock().unwrap())?;
+            let how = format!(
+                "Android is on its disk, but nothing on the disk can start it: the installer didn't put its boot loader there, so the PC stops at \"Booting from Hard Disk\".{}\n\nPurrDroid opens Bliss's installer again now. In it:\n1. In the first menu: Installation - Install BlissOS to harddisk.\n2. Pick vda1, then \"Do not re-format\", then Yes.\n3. OTA update: No.\n4. \"Do you want to install Grub2 bootloader?\": press the Left arrow so Yes is lit, then Enter. (Its default is Skip.)\n5. Reboot. Bliss starts from the disk.",
+                if converted { "\n\nThe disk was set up as GPT, where the installer can't put one; PurrDroid has made it MBR (nothing on it moved)." } else { "" }
+            );
+            let how = how.as_str();
             if GUI.load(Ordering::Relaxed) {
                 gui::message("PurrDroid: Android needs its boot loader", how)?;
             } else {
                 eprintln!("purrdroid: {}", how.replace("\n\n", " ").replace('\n', " "));
             }
             install = true;
+            // Converted, it has the hand-over code: tried before the ISO, so
+            // the installer's Reboot starts the installed Android.
+            disk_first = converted;
         }
     }
     if install {
@@ -1241,6 +1252,65 @@ fn blank_boot_code() -> [u8; 440] {
     code
 }
 
+/// A GPT disk's partitions (up to four) put in an MBR ("dos") table in
+/// their places, and the GPT headers and lists, at both ends, cleared.
+/// The first partition is made the bootable one. False if it isn't GPT,
+/// or can't be put in an MBR (a partition beyond 2 TiB, say).
+fn gpt_to_mbr(d: &mut dyn purrdroid_store::dev::BlockDev) -> Res<bool> {
+    let mut mbr = [0u8; 512];
+    d.read_at(0, &mut mbr)?;
+    if mbr[446 + 4] != 0xEE {
+        return Ok(false);
+    }
+    let mut hdr = [0u8; 512];
+    d.read_at(512, &mut hdr)?;
+    if &hdr[..8] != b"EFI PART" {
+        return Ok(false);
+    }
+    let u64_at = |b: &[u8], i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+    let (backup, entries_lba, count, size) = (u64_at(&hdr, 32), u64_at(&hdr, 72), u32_at(&hdr, 80) as u64, u32_at(&hdr, 84) as u64);
+    if !(128..=4096).contains(&size) || count > 1024 || entries_lba < 2 {
+        return Ok(false);
+    }
+    let mut list = vec![0u8; (count * size) as usize];
+    d.read_at(entries_lba * 512, &mut list)?;
+    let mut parts: Vec<(u64, u64)> = list
+        .chunks(size as usize)
+        .filter(|e| e[..16].iter().any(|&b| b != 0))
+        .map(|e| (u64_at(e, 32), u64_at(e, 40)))
+        .filter(|&(a, b)| a > 0 && b >= a)
+        .collect();
+    parts.sort_unstable();
+    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|&(_, last)| last >= u64::from(u32::MAX)) {
+        return Ok(false);
+    }
+    let mut out = [0u8; 512];
+    out[..440].copy_from_slice(&blank_boot_code());
+    out[440..444].copy_from_slice(&mbr[440..444]);
+    for (i, &(first, last)) in parts.iter().enumerate() {
+        let p = &mut out[446 + 16 * i..462 + 16 * i];
+        p[0] = if i == 0 { 0x80 } else { 0 };
+        p[1..4].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+        p[4] = 0x83;
+        p[5..8].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+        p[8..12].copy_from_slice(&(first as u32).to_le_bytes());
+        p[12..16].copy_from_slice(&((last - first + 1) as u32).to_le_bytes());
+    }
+    out[510..512].copy_from_slice(&[0x55, 0xAA]);
+    // The GPT, cleared: the header and its list at the start, and the
+    // copies at the end (the list just before the backup header).
+    let list_sectors = (count * size).div_ceil(512);
+    let zero = vec![0u8; ((entries_lba + list_sectors - 1) * 512) as usize];
+    d.write_at(512, &zero)?;
+    if backup > list_sectors && backup * 512 < d.len() {
+        d.write_at((backup - list_sectors) * 512, &vec![0u8; ((list_sectors + 1) * 512) as usize])?;
+    }
+    d.write_at(0, &out)?;
+    d.flush()?;
+    Ok(true)
+}
+
 /// A new Android disk, made ready for an ISO's installer: an MBR ("dos")
 /// partition table with one bootable Linux partition over all of it. The
 /// installer then offers vda1 straight away, and never a GPT disk, on
@@ -1452,5 +1522,87 @@ fn main() -> ExitCode {
             fail(&e.to_string());
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use purrdroid_store::dev::BlockDev;
+
+    struct Mem(Vec<u8>);
+    impl BlockDev for Mem {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_only(&self) -> bool {
+            false
+        }
+        fn read_at(&mut self, o: u64, b: &mut [u8]) -> io::Result<()> {
+            b.copy_from_slice(&self.0[o as usize..o as usize + b.len()]);
+            Ok(())
+        }
+        fn write_at(&mut self, o: u64, b: &[u8]) -> io::Result<()> {
+            self.0[o as usize..o as usize + b.len()].copy_from_slice(b);
+            Ok(())
+        }
+        fn trim(&mut self, _: u64, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_zeroes(&mut self, o: u64, n: usize) -> io::Result<()> {
+            self.0[o as usize..o as usize + n].fill(0);
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A GPT disk as cfdisk makes one: one partition from 2048 to the last
+    /// usable sector, the backup list and header at the end.
+    fn gpt_disk(sectors: u64) -> Mem {
+        let mut d = vec![0u8; (sectors * 512) as usize];
+        d[446 + 4] = 0xEE;
+        d[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        d[510] = 0x55;
+        d[511] = 0xAA;
+        let last = sectors - 1;
+        let mut hdr = [0u8; 92];
+        hdr[..8].copy_from_slice(b"EFI PART");
+        hdr[24..32].copy_from_slice(&1u64.to_le_bytes());
+        hdr[32..40].copy_from_slice(&last.to_le_bytes());
+        hdr[72..80].copy_from_slice(&2u64.to_le_bytes());
+        hdr[80..84].copy_from_slice(&128u32.to_le_bytes());
+        hdr[84..88].copy_from_slice(&128u32.to_le_bytes());
+        d[512..604].copy_from_slice(&hdr);
+        let entry = |d: &mut Vec<u8>, at: usize| {
+            d[at..at + 16].copy_from_slice(&[0xAF; 16]);
+            d[at + 32..at + 40].copy_from_slice(&2048u64.to_le_bytes());
+            d[at + 40..at + 48].copy_from_slice(&(last - 33).to_le_bytes());
+        };
+        entry(&mut d, 1024);
+        entry(&mut d, ((last - 32) * 512) as usize);
+        d[(last * 512) as usize..(last * 512) as usize + 8].copy_from_slice(b"EFI PART");
+        Mem(d)
+    }
+
+    #[test]
+    fn gpt_becomes_mbr_with_the_partition_where_it_was() {
+        let sectors = 64 * 2048;
+        let mut d = gpt_disk(sectors);
+        let data_before = d.0[2048 * 512..2049 * 512].to_vec();
+        assert!(gpt_to_mbr(&mut d).unwrap());
+        let m = &d.0[..512];
+        assert_eq!(&m[510..512], &[0x55, 0xAA]);
+        assert_eq!(&m[..440], &blank_boot_code()[..]);
+        assert_eq!(m[446], 0x80, "bootable");
+        assert_eq!(m[446 + 4], 0x83, "Linux, not GPT's 0xEE");
+        assert_eq!(u32::from_le_bytes(m[454..458].try_into().unwrap()), 2048);
+        assert_eq!(u64::from(u32::from_le_bytes(m[458..462].try_into().unwrap())), sectors - 1 - 33 - 2048 + 1);
+        assert!(d.0[512..34 * 512].iter().all(|&b| b == 0), "the GPT at the start is gone");
+        assert!(d.0[((sectors - 33) * 512) as usize..].iter().all(|&b| b == 0), "and its copy at the end");
+        assert_eq!(&d.0[2048 * 512..2049 * 512], &data_before[..], "the partition's contents aren't touched");
+        // Not GPT (now MBR): left alone.
+        assert!(!gpt_to_mbr(&mut d).unwrap());
     }
 }
