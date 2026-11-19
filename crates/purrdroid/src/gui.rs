@@ -235,6 +235,19 @@ impl Clipboard {
         Ok(())
     }
 
+    /// All of the text, if `sn` is the clipboard's answer (for pasting into
+    /// Android).
+    pub fn read_all(&self, conn: &RustConnection, win: Window, sn: &SelectionNotifyEvent) -> Option<String> {
+        if sn.selection != self.clipboard {
+            return None;
+        }
+        if sn.property == x11rb::NONE {
+            return Some(String::new());
+        }
+        let r = conn.get_property(true, win, self.prop, AtomEnum::ANY, 0, 1 << 18).ok()?.reply().ok()?;
+        Some(String::from_utf8_lossy(&r.value).into_owned())
+    }
+
     /// The text, if `sn` is the clipboard's answer: its first line, without
     /// the line break (a password copied with one would never match).
     /// `None` if it's another selection's.

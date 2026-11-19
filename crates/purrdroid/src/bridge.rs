@@ -44,11 +44,16 @@ pub enum Request {
     Shell(String, Sender<String>),
     /// Asks Android to shut down; answers whether it could be asked.
     PowerOff(Sender<bool>),
+    /// Types this text into what has the focus in Android (pasting, where
+    /// PurrDroid can't reach Android's clipboard).
+    Type(String),
 }
 
 pub enum Note {
     Status(String),
     Outbox(PathBuf),
+    /// Something was copied in Android: its text.
+    Clipboard(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -170,6 +175,31 @@ fn run(port: u16, key: Key, net: Net, outbox: PathBuf, rx: Receiver<Request>, no
                 None => {
                     let _ = reply.send("Android isn't connected yet: wait until it has started, and try again\n".into());
                 }
+            },
+            Ok(Request::Type(text)) => match adb.as_mut() {
+                Some(a) => {
+                    // `input text` types what a keyboard could: letters, digits
+                    // and the like (a space is written %s); a line break is Enter.
+                    let skipped = text.chars().any(|c| !(c.is_ascii_graphic() || c == ' ' || c == '\n'));
+                    let mut failed = false;
+                    for (i, line) in text.lines().enumerate() {
+                        if i > 0 && a.shell("input keyevent 66").is_err() {
+                            failed = true;
+                        }
+                        let typed: String = line.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect::<String>().replace(' ', "%s");
+                        if !typed.is_empty() && a.shell(&format!("input text {}", quote(&typed))).is_err() {
+                            failed = true;
+                        }
+                    }
+                    note(Note::Status(if failed {
+                        "Couldn't paste into Android".into()
+                    } else if skipped {
+                        "Pasted (this Android takes only plain letters, digits and signs typed in: the rest was left out)".into()
+                    } else {
+                        "Pasted into Android".into()
+                    }));
+                }
+                None => note(Note::Status(format!("{HOW_TO_CONNECT} Then paste again."))),
             },
             Ok(Request::PowerOff(reply)) => {
                 let ok = adb.as_mut().is_some_and(|a| a.shell("sync; svc power shutdown || reboot -p").is_ok());

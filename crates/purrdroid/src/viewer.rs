@@ -32,6 +32,11 @@ pub trait Sink: Send {
     fn key(&self, down: bool, keysym: u32, evdev: u32);
     /// The pointer at (x, y) of the frames shown; buttons as VNC has them.
     fn pointer(&self, buttons: u8, x: u16, y: u16);
+    /// Puts text on Android's clipboard, where the engine can (the
+    /// emulator); false where it can't, and it's typed in instead.
+    fn set_clipboard(&self, _text: &str) -> bool {
+        false
+    }
     /// A key pressed and let go (the toolbar's Back, Home...).
     fn press(&self, evdev: u32) {
         self.key(true, 0, evdev);
@@ -49,6 +54,9 @@ impl Sink for purrdroid_rfb::Input {
 }
 
 impl Sink for crate::emugrpc::Input {
+    fn set_clipboard(&self, text: &str) -> bool {
+        crate::emugrpc::Input::set_clipboard(self, text).is_ok()
+    }
     fn key(&self, down: bool, _keysym: u32, evdev: u32) {
         let _ = crate::emugrpc::Input::key(self, down, evdev);
     }
@@ -284,6 +292,16 @@ impl Viewer {
         let mut status = String::new();
         let mut installs: Vec<std::sync::mpsc::Receiver<String>> = Vec::new();
         let mut told_how = false;
+        // Copy and paste with the desktop: Ctrl+V asks X for the clipboard
+        // first (the V is held back till it comes); what's copied in
+        // Android is offered as the desktop's clipboard.
+        let clip = gui::Clipboard::new(&conn)?;
+        let clipboard_atom = gui::atom(&conn, "CLIPBOARD")?;
+        let targets_atom = gui::atom(&conn, "TARGETS")?;
+        let mut pasting = false;
+        let mut held_v: Option<u8> = None;
+        let mut android_clip: Option<String> = None;
+        let mut last_pasted: Option<String> = None;
         // Answers to the Privacy button.
         let mut replies: Vec<std::sync::mpsc::Receiver<String>> = Vec::new();
         self.wake.set_nonblocking(true)?;
@@ -413,7 +431,19 @@ impl Viewer {
                     Event::KeyPress(k) | Event::KeyRelease(k) if k.event == win => {
                         let down = matches!(ev, Event::KeyPress(_));
                         let shift = u16::from(k.state) & u16::from(KeyButMask::SHIFT) != 0;
+                        let ctrl = u16::from(k.state) & u16::from(KeyButMask::CONTROL) != 0;
                         let sym = keymap.keysym(k.detail, shift);
+                        // Ctrl+V: the desktop's clipboard first.
+                        if down && ctrl && (sym == 0x76 || sym == 0x56) {
+                            held_v = Some(k.detail);
+                            pasting = true;
+                            clip.ask(&conn, win)?;
+                            continue;
+                        }
+                        if !down && held_v == Some(k.detail) {
+                            held_v = None;
+                            continue;
+                        }
                         self.input.key(down, sym, k.detail.saturating_sub(8) as u32);
                         if down {
                             if !held.contains(&k.detail) {
@@ -524,6 +554,54 @@ impl Viewer {
                         }
                         xdnd::on_message(&conn, &atoms, win, &mut incoming, &c)?;
                     }
+                    Event::SelectionNotify(s) if pasting && s.selection == clipboard_atom => {
+                        pasting = false;
+                        let text = clip.read_all(&conn, win, &s).unwrap_or_default();
+                        if text.is_empty() {
+                            status = "Nothing to paste: the desktop's clipboard is empty".into();
+                            draw_toolbar(ww, net_on, &status)?;
+                        } else if self.input.set_clipboard(&text) {
+                            // On Android's clipboard: Android's own Ctrl+V (Ctrl is held).
+                            last_pasted = Some(text);
+                            self.input.key(true, 0x76, 47);
+                            self.input.key(false, 0x76, 47);
+                        } else {
+                            last_pasted = Some(text.clone());
+                            let _ = self.bridge.send(Request::Type(text));
+                        }
+                    }
+                    Event::SelectionRequest(r) if r.selection == clipboard_atom => {
+                        let mut prop = r.property;
+                        if let Some(text) = android_clip.as_ref() {
+                            if r.target == targets_atom {
+                                conn.change_property32(
+                                    PropMode::REPLACE,
+                                    r.requestor,
+                                    r.property,
+                                    AtomEnum::ATOM,
+                                    &[targets_atom, utf8, u32::from(AtomEnum::STRING)],
+                                )?;
+                            } else if r.target == utf8 || r.target == u32::from(AtomEnum::STRING) {
+                                conn.change_property8(PropMode::REPLACE, r.requestor, r.property, r.target, text.as_bytes())?;
+                            } else {
+                                prop = x11rb::NONE;
+                            }
+                        } else {
+                            prop = x11rb::NONE;
+                        }
+                        let notify = SelectionNotifyEvent {
+                            response_type: SELECTION_NOTIFY_EVENT,
+                            sequence: 0,
+                            time: r.time,
+                            requestor: r.requestor,
+                            selection: r.selection,
+                            target: r.target,
+                            property: prop,
+                        };
+                        conn.send_event(false, r.requestor, EventMask::NO_EVENT, notify)?;
+                        conn.flush()?;
+                    }
+                    Event::SelectionClear(c) if c.selection == clipboard_atom => android_clip = None,
                     Event::SelectionNotify(s) => {
                         if let Some(d) = xdnd::read_drop(&conn, &atoms, win, &mut incoming, &s) {
                             let items: Vec<Item> = match d {
@@ -626,6 +704,17 @@ impl Viewer {
                         status = s;
                         set_title(&conn, win, net_name, utf8, &format!("{} - {status}", self.title))?;
                         draw_toolbar(ww, net_on, &status)?;
+                    }
+                    Note::Clipboard(text) => {
+                        // Copied in Android: the desktop's clipboard now (not what
+                        // was just pasted in coming back).
+                        if !text.is_empty() && last_pasted.as_deref() != Some(text.as_str()) {
+                            conn.set_selection_owner(win, clipboard_atom, x11rb::CURRENT_TIME)?;
+                            conn.flush()?;
+                            android_clip = Some(text);
+                            status = "Copied from Android: paste it anywhere on the desktop".into();
+                            draw_toolbar(ww, net_on, &status)?;
+                        }
                     }
                     Note::Outbox(path) => {
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();

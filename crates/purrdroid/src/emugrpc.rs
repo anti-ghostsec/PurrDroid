@@ -520,6 +520,11 @@ impl Input {
         self.inner.send(ev)
     }
 
+    /// Puts `text` on Android's clipboard.
+    pub fn set_clipboard(&self, text: &str) -> io::Result<()> {
+        set_clipboard(&self.inner.c, text)
+    }
+
     /// A key pressed and let go (Back, Home...).
     pub fn press(&self, evdev: u32) -> io::Result<()> {
         let mut k = Vec::new();
@@ -603,6 +608,35 @@ impl Inner {
         self.mouse(x, start + dir * len, 1)?;
         self.mouse(x, start + dir * len, 0)
     }
+}
+
+/// Puts `text` on Android's clipboard (setClipboard).
+pub fn set_clipboard(c: &Client, text: &str) -> io::Result<()> {
+    let id = c.open("setClipboard", None)?;
+    let mut m = Vec::new();
+    field_bytes(&mut m, 1, text.as_bytes());
+    c.message(id, &m, true)
+}
+
+/// Calls `changed` with Android's clipboard each time something is copied
+/// in Android (streamClipboard; the first is what's on it now).
+pub fn stream_clipboard(c: &Client, changed: impl Fn(String) + Send + 'static) -> io::Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    let sink = move |bytes: &[u8]| {
+        buf.extend_from_slice(bytes);
+        while buf.len() >= 5 {
+            let mlen = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+            if buf.len() < 5 + mlen {
+                break;
+            }
+            let msg: Vec<u8> = buf[5..5 + mlen].to_vec();
+            buf.drain(..5 + mlen);
+            let text = fields(&msg).into_iter().find(|(n, _, _)| *n == 1).map(|(_, _, b)| String::from_utf8_lossy(b).into_owned());
+            changed(text.unwrap_or_default());
+        }
+    };
+    let id = c.open("streamClipboard", Some(Box::new(sink)))?;
+    c.message(id, &[], true)
 }
 
 /// Where the frames go: a file in the session's folder in memory.

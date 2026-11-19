@@ -86,11 +86,26 @@ pub fn clean_leftovers() {
         let Ok(rd) = fs::read_dir(&base) else { continue };
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&format!("purrdroid-emu-{uid}-")) {
+            // Only a session that's gone: a running one holds the lock on
+            // its folder's in-use file (and two PurrDroids can run with
+            // different runtime folders, testing one, say).
+            if name.starts_with(&format!("purrdroid-emu-{uid}-")) && !in_use(&e.path()) {
                 let _ = fs::remove_dir_all(e.path());
             }
         }
     }
+}
+
+/// This PurrDroid's in-use locks on its folders in memory: held until it
+/// ends, however it ends (the kernel lets go of them then).
+static HELD: std::sync::Mutex<Vec<fs::File>> = std::sync::Mutex::new(Vec::new());
+const IN_USE: &str = ".in-use";
+
+fn in_use(dir: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(f) = fs::File::open(dir.join(IN_USE)) else { return false };
+    // SAFETY: flock on a descriptor this function owns.
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
 }
 
 fn candidates() -> Vec<PathBuf> {
@@ -115,6 +130,15 @@ pub fn ram_dir(need: u64) -> io::Result<RamDir> {
         vaultkit::random_bytes(&mut r).map_err(io::Error::from)?;
         let dir = base.join(format!("purrdroid-emu-{uid}-{}", r.iter().map(|b| format!("{b:02x}")).collect::<String>()));
         fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        {
+            use std::os::unix::io::AsRawFd;
+            let f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(dir.join(IN_USE))?;
+            // SAFETY: flock on a descriptor kept open for as long as PurrDroid runs.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            HELD.lock().unwrap().push(f);
+        }
         return Ok(RamDir(dir));
     }
     Err(io::Error::other(format!(
@@ -425,6 +449,25 @@ pub fn unseal(path: &Path, key: &[u8; 32], dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_sessions_folder_is_left_alone() {
+        use std::os::unix::io::AsRawFd;
+        let mut r = [0u8; 8];
+        vaultkit::random_bytes(&mut r).unwrap();
+        let base = std::env::temp_dir().join(format!("purrdroid-inuse-{}", r.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+        let (busy, gone) = (base.join("busy"), base.join("gone"));
+        fs::create_dir_all(&busy).unwrap();
+        fs::create_dir_all(&gone).unwrap();
+        let held = File::create(busy.join(IN_USE)).unwrap();
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        File::create(gone.join(IN_USE)).unwrap();
+        assert!(in_use(&busy), "a locked folder is in use");
+        assert!(!in_use(&gone), "an unlocked one isn't");
+        drop(held);
+        assert!(!in_use(&busy), "nor once its session has ended");
+        fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn seal_and_unseal_a_folder() {

@@ -864,6 +864,7 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
     let outbox = rt.join("outbox");
     let (notes_tx, notes_rx) = mpsc::channel();
     let mut notes_rx = Some(notes_rx);
+    let clip_tx = notes_tx.clone();
     let bridge_tx = bridge::start(console + 1, adb_key, net, outbox.clone(), notes_tx, || {});
     bridge::serve_control(rt.join("control.sock"), bridge_tx.clone())?;
     unsafe {
@@ -897,6 +898,7 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
                     eprintln!("purrdroid: frame test: {e}");
                     return;
                 }
+                let _ = emugrpc::stream_clipboard(&client, |text| eprintln!("purrdroid: frame test: Android's clipboard: {text:?}"));
                 let input = emugrpc::Input::new(client, (w * 2, h * 2), frame.clone());
                 let mut last = 0;
                 for round in 0.. {
@@ -924,6 +926,7 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
                                 Some("press") => input.press(u32::from(n(1))),
                                 Some("wheel") => input.pointer(if w.get(1) == Some(&"UP") { 8 } else { 16 }, n(2), n(3)),
                                 Some("click") => input.pointer(1, n(1), n(2)).and_then(|()| input.pointer(0, n(1), n(2))),
+                                Some("clip") => input.set_clipboard(l.split_once(' ').map_or("", |(_, t)| t)),
                                 _ => Ok(()),
                             };
                             eprintln!("purrdroid: input test: {l}: {r:?}");
@@ -966,6 +969,14 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
             let waker = move || {
                 let _ = (&*wake_w).write(&[1]);
             };
+            // What's copied in Android, for the desktop's clipboard.
+            {
+                let wake = waker.clone();
+                let _ = emugrpc::stream_clipboard(&client, move |text| {
+                    let _ = clip_tx.send(bridge::Note::Clipboard(text));
+                    wake();
+                });
+            }
             emugrpc::stream_screen(&client, &emugrpc::shm_path(&ramdir.0), sw, sh, frame.clone(), waker)?;
             splash.take();
             let input = emugrpc::Input::new(client, (cfg.width, cfg.height), frame.clone());
