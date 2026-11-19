@@ -264,7 +264,7 @@ fn install_apks(a: &mut Adb, items: Vec<Item>) -> (String, bool) {
             }
         }
         match res {
-            Ok(said) => out.push_str(&format!("{name}: {}\n", said.trim())),
+            Ok(said) => out.push_str(&format!("{name}: {}\n", explain_install(said.trim()))),
             Err(purrdroid_adb::Error::Failed(msg)) => out.push_str(&format!("{name}: Android said: {msg}\n")),
             Err(e) => {
                 out.push_str(&format!("{name}: {e}\n"));
@@ -273,6 +273,44 @@ fn install_apks(a: &mut Adb, items: Vec<Item>) -> (String, bool) {
         }
     }
     (out, false)
+}
+
+/// Android's answer to an install, with the usual failures said plainly
+/// (Android's own words kept after them).
+fn explain_install(said: &str) -> String {
+    // Android's API levels, as Android versions.
+    fn version(api: u32) -> String {
+        match api {
+            21 | 22 => "5".into(),
+            23 => "6".into(),
+            24 | 25 => "7".into(),
+            26 | 27 => "8".into(),
+            28 => "9".into(),
+            29..=31 => (api - 19).to_string(),
+            32 => "12L".into(),
+            33..=36 => (api - 20).to_string(),
+            _ => format!("API {api}"),
+        }
+    }
+    let numbers =
+        |after: &str| -> Option<u32> { said.split(after).nth(1)?.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())?.parse().ok() };
+    let plain = if said.contains("INSTALL_FAILED_OLDER_SDK") {
+        match (numbers("newer sdk version #"), numbers("current version is #")) {
+            (Some(need), Some(have)) => format!("needs Android {} or newer; this one is Android {}.", version(need), version(have)),
+            _ => "needs a newer Android than this one.".into(),
+        }
+    } else if said.contains("INSTALL_FAILED_NO_MATCHING_ABIS") {
+        "is built for another kind of processor only (ARM, say), and this Android can't run it.".into()
+    } else if said.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") || said.contains("INSTALL_FAILED_SHARED_USER_INCOMPATIBLE") {
+        "is signed with another key than the copy already installed: uninstall that one first.".into()
+    } else if said.contains("INSTALL_FAILED_VERSION_DOWNGRADE") {
+        "is older than the copy already installed.".into()
+    } else if said.contains("INSTALL_FAILED_INSUFFICIENT_STORAGE") {
+        "doesn't fit: Android's storage is full.".into()
+    } else {
+        return said.to_string();
+    };
+    format!("not installed: it {plain} (Android said: {said})")
 }
 
 /// How to switch Android's side of the bridge on (an Android from an ISO;
@@ -694,6 +732,13 @@ fn talk(control: &Path, kind: u8, files: &[PathBuf], texts: &[String]) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_failures_said_plainly() {
+        let said = "Failure [INSTALL_FAILED_OLDER_SDK: Failed parse during installPackageLI: /data/app/x.tmp/base.apk (at Binary XML file line #0): Requires newer sdk version #35 (current version is #30)]";
+        assert!(explain_install(said).starts_with("not installed: it needs Android 15 or newer; this one is Android 11."));
+        assert_eq!(explain_install("Success"), "Success");
+    }
 
     #[test]
     fn names() {
