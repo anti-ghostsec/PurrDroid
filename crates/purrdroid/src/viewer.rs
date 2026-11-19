@@ -65,8 +65,19 @@ impl Sink for crate::emugrpc::Input {
 
 /// The toolbar's buttons: label, width, and the Linux key code each sends
 /// (0: the network switch).
-const TOOLS: [(&str, u16, u32); 7] =
-    [("Back", 52, 158), ("Home", 52, 172), ("Apps", 52, 580), ("Power", 56, 116), ("Vol -", 50, 114), ("Vol +", 50, 115), ("", 110, 0)];
+/// Label, width, and the key it presses: 0 is the network switch, PRIVACY
+/// opens AnonpheneOS privacy (which has no icon of its own).
+const TOOLS: [(&str, u16, u32); 8] = [
+    ("Back", 52, 158),
+    ("Home", 52, 172),
+    ("Apps", 52, 580),
+    ("Power", 56, 116),
+    ("Vol -", 50, 114),
+    ("Vol +", 50, 115),
+    ("Privacy", 64, PRIVACY),
+    ("", 110, 0),
+];
+const PRIVACY: u32 = 1;
 const CHIP_W: u16 = 200;
 
 pub struct Viewer {
@@ -272,6 +283,8 @@ impl Viewer {
         let mut last_pointer = (0u16, 0u16);
         let mut status = String::new();
         let mut installs: Vec<std::sync::mpsc::Receiver<String>> = Vec::new();
+        // Answers to the Privacy button.
+        let mut replies: Vec<std::sync::mpsc::Receiver<String>> = Vec::new();
         self.wake.set_nonblocking(true)?;
 
         let view_h = |wh: u16, chips: &Vec<Chip>| if chips.is_empty() { wh } else { wh.saturating_sub(TRAY_H) };
@@ -375,7 +388,13 @@ impl Viewer {
                         let mut x = 4i16;
                         for (_, w, code) in TOOLS {
                             if (x..x + w as i16).contains(&b.event_x) {
-                                if code != 0 {
+                                if code == PRIVACY {
+                                    let (tx, rx) = std::sync::mpsc::channel();
+                                    let cmd = "am start -n app.anonphene.privacy/.PrivacyActivity 2>&1 | grep -q Error && echo missing";
+                                    let _ = self.bridge.send(Request::Shell(cmd.into(), tx));
+                                    replies.push(rx);
+                                    status = "Opening AnonpheneOS privacy...".into();
+                                } else if code != 0 {
                                     self.input.press(code);
                                 } else {
                                     net_on = !net_on;
@@ -554,6 +573,25 @@ impl Viewer {
                 }
             }
 
+            let mut said = Vec::new();
+            replies.retain(|r| match r.try_recv() {
+                Ok(t) => {
+                    said.push(t);
+                    false
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+                Err(_) => false,
+            });
+            for t in said {
+                status = if t.contains("missing") {
+                    "AnonpheneOS privacy isn't installed: drop AnonPrivacy.apk on this window".into()
+                } else if t.contains("isn't connected") {
+                    "Android hasn't finished starting yet".into()
+                } else {
+                    String::new()
+                };
+                draw_toolbar(ww, net_on, &status)?;
+            }
             let mut done_installs = Vec::new();
             installs.retain(|r| match r.try_recv() {
                 Ok(t) => {

@@ -218,6 +218,16 @@ web links open in. For [Wisp](https://github.com/anti-ghostsec/wisp), drop
 its x86_64 build (`android/build-android.sh x86_64`, `wisp-x86.apk`) on the
 window.
 
+[AnonpheneOS](https://github.com/anti-ghostsec/AnonpheneOS)'s apps have no
+icons: AnonpheneOS opens them from its own Settings and dialer, which other
+Androids haven't got. Dropped on the window, *AnonpheneOS privacy* opens
+straight away, and the toolbar's **Privacy** button opens it again; its
+**Secure Folder** entry opens the Secure Folder (slowly the first time).
+
+The mouse wheel scrolls by dragging (the emulator gives Android a
+touchscreen, not a mouse), on a thread of its own: a quick spin is added up
+into one drag, and never holds the window up.
+
 - Android's data is in memory while it runs (about 0.5 GiB fresh, more as
   apps go in), and `--data GiB` (default 4) sets its partition's size.
 - Memory, all of it from the PC's RAM: Android gets 2 GiB (`--ram MB` for

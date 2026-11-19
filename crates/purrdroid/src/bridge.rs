@@ -214,6 +214,21 @@ fn install_apks(a: &mut Adb, items: Vec<Item>) -> (String, bool) {
                 if a.shell(&cmd).is_ok_and(|s| s.trim() == "browser") {
                     out.push_str(&format!("{name}: {pkg} now opens web links\n"));
                 }
+                // AnonpheneOS's apps are opened from inside AnonpheneOS itself
+                // (Settings, a dialer code), which another Android hasn't got.
+                match pkg.as_str() {
+                    // Opened from AnonpheneOS privacy (its Secure Folder entry);
+                    // Android doesn't let anything else switch its icon on.
+                    "app.anonphene.securefolder" => {
+                        out.push_str(&format!("{name}: open it with PurrDroid's Privacy button, then Secure Folder\n"));
+                    }
+                    // No icon of its own: opened now, and from PurrDroid's Privacy button after.
+                    "app.anonphene.privacy" => {
+                        let _ = a.shell("am start -n app.anonphene.privacy/.PrivacyActivity >/dev/null 2>&1");
+                        out.push_str(&format!("{name}: opened; PurrDroid's Privacy button opens it again\n"));
+                    }
+                    _ => {}
+                }
             }
         }
         match res {

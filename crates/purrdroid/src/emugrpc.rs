@@ -457,19 +457,101 @@ pub fn stream_screen(c: &Client, shm: &Path, w: u32, h: u32, frame: Arc<Mutex<Fr
 
 /// Sends the mouse, the wheel and keys to Android, on one long stream.
 pub struct Input {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     c: Client,
     id: Mutex<Option<u32>>,
     /// Android's screen as the emulator measures it, for scaling.
-    pub device: (u32, u32),
+    device: (u32, u32),
     /// The frames' size, which pointer positions come in.
-    pub shown: Arc<Mutex<Frame>>,
+    shown: Arc<Mutex<Frame>>,
+    /// Wheel notches not scrolled yet (+ up, - down) and where, in
+    /// Android's pixels; the wheel thread takes them.
+    wheel: Mutex<(i64, i64, i64)>,
+    wheel_ready: Condvar,
+    /// A button is held: the wheel waits.
+    held: std::sync::atomic::AtomicBool,
 }
 
 impl Input {
     pub fn new(c: Client, device: (u32, u32), shown: Arc<Mutex<Frame>>) -> Input {
-        Input { c, id: Mutex::new(None), device, shown }
+        let inner = Arc::new(Inner {
+            c,
+            id: Mutex::new(None),
+            device,
+            shown,
+            wheel: Mutex::new((0, 0, 0)),
+            wheel_ready: Condvar::new(),
+            held: std::sync::atomic::AtomicBool::new(false),
+        });
+        // The wheel scrolls on its own thread, so the window never waits for
+        // it: a quick spin is many notches, and each is a drag that takes a
+        // moment. Notches that come in while one is being done are added
+        // up into the next.
+        let weak = Arc::downgrade(&inner);
+        thread::spawn(move || loop {
+            let Some(me) = weak.upgrade() else { return };
+            let (notches, x, y) = {
+                let g = me.wheel.lock().unwrap();
+                let (mut g, _) = me.wheel_ready.wait_timeout_while(g, Duration::from_secs(1), |w| w.0 == 0).unwrap();
+                std::mem::replace(&mut *g, (0, 0, 0))
+            };
+            if notches != 0 && !me.held.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = me.scroll(notches.clamp(-6, 6), x, y);
+            }
+        });
+        Input { inner }
     }
 
+    /// A key, by its Linux (evdev) code.
+    pub fn key(&self, down: bool, evdev: u32) -> io::Result<()> {
+        let mut k = Vec::new();
+        field_int(&mut k, 1, 1); // Evdev
+        field_int(&mut k, 2, if down { 0 } else { 1 });
+        field_int(&mut k, 3, evdev as i64);
+        let mut ev = Vec::new();
+        field_bytes(&mut ev, 1, &k);
+        self.inner.send(ev)
+    }
+
+    /// A key pressed and let go (Back, Home...).
+    pub fn press(&self, evdev: u32) -> io::Result<()> {
+        let mut k = Vec::new();
+        field_int(&mut k, 1, 1);
+        field_int(&mut k, 2, 2);
+        field_int(&mut k, 3, evdev as i64);
+        let mut ev = Vec::new();
+        field_bytes(&mut ev, 1, &k);
+        self.inner.send(ev)
+    }
+
+    /// The pointer at (`x`, `y`) of the frames shown, buttons as VNC has
+    /// them (bit 0 left, 2 right, 3/4 the wheel).
+    pub fn pointer(&self, buttons: u8, x: u16, y: u16) -> io::Result<()> {
+        let me = &self.inner;
+        let (fw, fh) = {
+            let f = me.shown.lock().unwrap();
+            (f.width.max(1) as i64, f.height.max(1) as i64)
+        };
+        let dx = x as i64 * me.device.0 as i64 / fw;
+        let dy = y as i64 * me.device.1 as i64 / fh;
+        if buttons & 0b11000 != 0 {
+            // Handed to the wheel thread; never waited for here.
+            if buttons & 0b101 == 0 {
+                let mut w = me.wheel.lock().unwrap();
+                *w = (w.0 + if buttons & 8 != 0 { 1 } else { -1 }, dx, dy);
+                me.wheel_ready.notify_one();
+            }
+            return Ok(());
+        }
+        me.held.store(buttons & 0b101 != 0, std::sync::atomic::Ordering::Relaxed);
+        me.mouse(dx, dy, ((buttons & 1) | if buttons & 4 != 0 { 2 } else { 0 }) as i64)
+    }
+}
+
+impl Inner {
     fn send(&self, event: Vec<u8>) -> io::Result<()> {
         let mut id = self.id.lock().unwrap();
         if id.is_none() {
@@ -482,73 +564,38 @@ impl Input {
         r
     }
 
-    /// A key, by its Linux (evdev) code.
-    pub fn key(&self, down: bool, evdev: u32) -> io::Result<()> {
-        let mut k = Vec::new();
-        field_int(&mut k, 1, 1); // Evdev
-        field_int(&mut k, 2, if down { 0 } else { 1 });
-        field_int(&mut k, 3, evdev as i64);
-        let mut ev = Vec::new();
-        field_bytes(&mut ev, 1, &k);
-        self.send(ev)
-    }
-
-    /// A key pressed and let go (Back, Home...).
-    pub fn press(&self, evdev: u32) -> io::Result<()> {
-        let mut k = Vec::new();
-        field_int(&mut k, 1, 1);
-        field_int(&mut k, 2, 2);
-        field_int(&mut k, 3, evdev as i64);
-        let mut ev = Vec::new();
-        field_bytes(&mut ev, 1, &k);
-        self.send(ev)
-    }
-
-    /// The pointer at (`x`, `y`) of the frames shown, buttons as VNC has
-    /// them (bit 0 left, 2 right, 3/4 the wheel).
-    pub fn pointer(&self, buttons: u8, x: u16, y: u16) -> io::Result<()> {
-        let (fw, fh) = {
-            let f = self.shown.lock().unwrap();
-            (f.width.max(1) as i64, f.height.max(1) as i64)
-        };
-        let dx = x as i64 * self.device.0 as i64 / fw;
-        let dy = y as i64 * self.device.1 as i64 / fh;
-        if buttons & 0b11000 != 0 {
-            // The emulator gives Android touchscreens but no mouse, so the
-            // wheel goes nowhere as a wheel: each notch is a short slow drag
-            // instead (up the screen to go down the page), slow enough not
-            // to fling. Not while a button is held.
-            if buttons & 0b101 != 0 {
-                return Ok(());
-            }
-            let step = (self.device.1 as i64 / 7).max(80);
-            let dir = if buttons & 8 != 0 { 1 } else { -1 };
-            let drag = |m: i64, y: i64| {
-                let mut e = Vec::new();
-                field_int(&mut e, 1, dx);
-                field_int(&mut e, 2, y.clamp(0, self.device.1 as i64 - 1));
-                field_int(&mut e, 3, m);
-                let mut ev = Vec::new();
-                field_bytes(&mut ev, 3, &e);
-                self.send(ev)
-            };
-            drag(1, dy)?;
-            for i in 1..=10 {
-                std::thread::sleep(std::time::Duration::from_millis(16));
-                drag(1, dy + dir * step * i / 10)?;
-            }
-            // Held still a moment at the end: a drag, not a fling.
-            std::thread::sleep(std::time::Duration::from_millis(60));
-            drag(1, dy + dir * step)?;
-            return drag(0, dy + dir * step);
-        }
+    fn mouse(&self, x: i64, y: i64, buttons: i64) -> io::Result<()> {
         let mut m = Vec::new();
-        field_int(&mut m, 1, dx);
-        field_int(&mut m, 2, dy);
-        field_int(&mut m, 3, ((buttons & 1) | if buttons & 4 != 0 { 2 } else { 0 }) as i64);
+        field_int(&mut m, 1, x);
+        field_int(&mut m, 2, y.clamp(0, self.device.1 as i64 - 1));
+        field_int(&mut m, 3, buttons);
         let mut ev = Vec::new();
         field_bytes(&mut ev, 3, &m);
         self.send(ev)
+    }
+
+    /// The emulator gives Android touchscreens but no mouse, so the wheel
+    /// goes nowhere as a wheel: `notches` become one slow drag (up the
+    /// screen to go down the page), slow enough not to fling.
+    fn scroll(&self, notches: i64, x: i64, y: i64) -> io::Result<()> {
+        let per = (self.device.1 as i64 / 7).max(80);
+        // Never off the screen: from where the pointer is, as far as fits.
+        let room = if notches > 0 { self.device.1 as i64 - 1 - y } else { y };
+        let len = (per * notches.abs()).min(room.max(0));
+        if len < 8 {
+            return Ok(());
+        }
+        let dir = notches.signum();
+        self.mouse(x, y, 1)?;
+        let steps = 10 + 2 * notches.abs();
+        for i in 1..=steps {
+            thread::sleep(Duration::from_millis(16));
+            self.mouse(x, y + dir * len * i / steps, 1)?;
+        }
+        // Held still a moment at the end: a drag, not a fling.
+        thread::sleep(Duration::from_millis(60));
+        self.mouse(x, y + dir * len, 1)?;
+        self.mouse(x, y + dir * len, 0)
     }
 }
 
