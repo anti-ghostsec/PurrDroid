@@ -230,11 +230,13 @@ into one drag, and never holds the window up.
 
 - Android's data is in memory while it runs (about 0.5 GiB fresh, more as
   apps go in), and `--data GiB` (default 4) sets its partition's size.
-- Memory, all of it from the PC's RAM: about 3.7 GiB for the emulator with
-  Android in it (measured with Wisp open; giving Android less than its
-  default 2 GiB doesn't make that smaller), plus Android's data disk, which
-  is in memory too and only grows (about 1 GiB with Wisp installed). That's
-  around 5 GiB in all. PurrDroid starts only if 600 MiB would still be left
+- Memory, all of it from the PC's RAM: what Android is given (1.5 GiB on a
+  PC with less than 16 GiB, 2 GiB otherwise, `--ram MB` to choose) plus about
+  1.2 GiB for the emulator itself, and Android's data disk, which is in
+  memory too and only grows (about 1 GiB with Wisp installed): about 3.7 GiB
+  in all with Wisp open. (The emulator raises Android's memory to 2.5 GiB
+  whatever it's asked for; PurrDroid hands its QEMU the size asked for
+  instead, which saves 1 GiB.) PurrDroid starts only if 600 MiB would still be left
   for everything else, and shuts Android down properly if the PC stays
   under 250 MiB free for two seconds. Without swap a PC that runs out
   freezes, so it's the emulator the kernel stops first if it comes to that.

@@ -219,6 +219,11 @@ pub fn command(ram: &Path, c: &Config, console: u16) -> Command {
     if !c.window {
         q.arg("-no-window");
     }
+    // The emulator raises Android's memory to 2.5 GiB whatever it's asked
+    // for, and Android fills it with cache that the PC never gets back. Its
+    // QEMU takes the last size it's given, so this, last of all, is the size
+    // asked for.
+    q.arg("-qemu").arg("-m").arg(format!("{}M", c.ram_mb));
 
     let home = ram.join("home");
     q.env("ANDROID_SDK_ROOT", &c.sdk)

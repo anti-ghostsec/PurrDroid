@@ -717,15 +717,14 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
         v.settings.set("emu_gpu", "host");
     }
     // Memory, all of it from the PC's RAM, as measured with /e/OS and
-    // Wisp open: the emulator's process takes about 3.7 GiB whether
-    // Android is given 1.5 or 2 (it's at least that), or what Android is
-    // given and 1.7 GiB more; then Android's data disk, which is in memory
-    // too and only grows (what Android deletes on it isn't handed back);
-    // and some left for the rest of the PC, which has nothing to fall back
-    // on without swap. What Android touches stays taken until it stops,
-    // even once Android frees it, so it's all counted as in use.
-    const EMU_EXTRA_MB: u64 = 1700;
-    const EMU_LEAST_MB: u64 = 3750;
+    // Wisp open: what Android is given (the emulator would raise it to
+    // 2.5 GiB; see emu::command) and about 1.2 GiB of the emulator's own;
+    // then Android's data disk, which is in memory too and only grows (what
+    // Android deletes on it isn't handed back); and some left for the rest
+    // of the PC, which has nothing to fall back on without swap. What
+    // Android touches stays taken until it stops, even once Android frees
+    // it, so it's all counted as in use.
+    const EMU_EXTRA_MB: u64 = 1200;
     const DATA_GROWTH_MB: u64 = 300;
     const PC_KEEP_MB: u64 = 600;
     let state_mb = match (v.settings.get("emu_state"), v.settings.key("emu_key")) {
@@ -733,12 +732,24 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
         _ => 600,
     };
     let asked = flag_value(args, "--ram").is_some() || v.settings.get("ram_mb").is_some();
-    // Less than 2 GiB saves nothing (see above), so 2 unless asked.
-    let ram = if asked { ram } else { 2048 };
+    // 1.5 GiB on a PC with less than 16: enough for Android with Wisp open.
+    let total_mb = fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|t| t.lines().find_map(|l| l.strip_prefix("MemTotal:").and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())))
+        .map_or(0, |kb| kb / 1024);
+    let ram = if asked {
+        ram
+    } else if total_mb >= 15 * 1024 {
+        2048
+    } else {
+        1536
+    };
     let free = mem_available_mb();
-    let emulator_mb = (u64::from(ram) + EMU_EXTRA_MB).max(EMU_LEAST_MB);
+    let emulator_mb = u64::from(ram) + EMU_EXTRA_MB;
     let need = emulator_mb + state_mb + DATA_GROWTH_MB + PC_KEEP_MB;
-    if need > free {
+    // PURRDROID_TEST_MEMORY=1: for measuring the emulator itself (the stop
+    // on low memory still watches).
+    if need > free && std::env::var_os("PURRDROID_TEST_MEMORY").is_none() {
         return Err(format!(
             "there isn't enough free memory to start Android without slowing the whole PC down: {free} MiB is free, and it needs about {need} MiB ({emulator_mb} MiB for the emulator with Android in it, {} for Android's data, which is kept in memory, and {PC_KEEP_MB} kept for everything else). Close some programs and try again.",
             state_mb + DATA_GROWTH_MB,
