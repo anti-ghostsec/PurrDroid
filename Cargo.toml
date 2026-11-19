@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/store",
+    "crates/nbd",
+    "crates/adb",
+    "crates/rfb",
+    "crates/purrdroid",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+purrdroid-store = { path = "crates/store" }
+purrdroid-nbd = { path = "crates/nbd" }
+purrdroid-adb = { path = "crates/adb" }
+purrdroid-rfb = { path = "crates/rfb" }
+vaultkit = { git = "https://github.com/anti-ghostsec/deniable", tag = "v0.2.0" }
+deniable = { git = "https://github.com/anti-ghostsec/deniable", tag = "v0.2.0" }
+zeroize = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

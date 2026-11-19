@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- A round robot head with cat ears, behind a padlock. -->
+  <path d="M14 26 L12 8 L26 18 Z M50 26 L52 8 L38 18 Z" fill="#3a8f5c"/>
+  <rect x="10" y="16" width="44" height="34" rx="16" fill="#4caf72"/>
+  <circle cx="24" cy="31" r="4" fill="#fff"/>
+  <circle cx="40" cy="31" r="4" fill="#fff"/>
+  <circle cx="24" cy="31" r="2" fill="#123"/>
+  <circle cx="40" cy="31" r="2" fill="#123"/>
+  <path d="M29 39 Q32 42 35 39" stroke="#123" stroke-width="2" fill="none"/>
+  <path d="M41 46 v-4 a5 5 0 0 1 10 0 v4" stroke="#555" stroke-width="2.5" fill="none"/>
+  <rect x="38" y="45" width="16" height="13" rx="2" fill="#f2c230" stroke="#8a6d12"/>
+  <circle cx="46" cy="51" r="1.8" fill="#8a6d12"/>
+</svg>

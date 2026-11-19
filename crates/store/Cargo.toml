@@ -1,0 +1,16 @@
+[package]
+name = "purrdroid-store"
+description = "PurrDroid's storage: a password-sealed vault and XChaCha20-Poly1305 encrypted virtual disks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vaultkit.workspace = true
+zeroize.workspace = true
+libc.workspace = true
+blake2 = "0.10"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+sha2 = "0.10"
+deniable.workspace = true

@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  # Signed build provenance (see "Attest" below).
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Actions are pinned by commit: a tag can be moved to point at other code.
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # The release says which version it is: the tag and Cargo.toml agree.
+      - name: Check the version
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$want" = "$have" ] || { echo "the tag is $GITHUB_REF_NAME but Cargo.toml says $have" >&2; exit 1; }
+
+      - name: Test
+        run: cargo test --workspace --locked --release
+
+      # Static (musl): one file that runs on any x86_64 Linux.
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          name="purrdroid-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "dist/$name/icons"
+          cp target/x86_64-unknown-linux-musl/release/purrdroid install.sh README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cp icons/purrdroid.svg "dist/$name/icons/"
+          tar -C dist --owner=0 --group=0 -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
+
+      # A signed statement, kept by GitHub (Sigstore), that this file was
+      # built by this workflow from this commit. Check a download with:
+      # gh attestation verify purrdroid-*.tar.gz --repo anti-ghostsec/PurrDroid
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: ${{ env.ASSET }}
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: PurrDroid ${{ github.ref_name }}
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          body: |
+            PurrDroid for x86_64 Linux: one static program, nothing to compile.
+
+            Unpack it and run `./install.sh` (for your user only, nothing system-wide),
+            then open PurrDroid from the Start menu. It needs QEMU and /dev/kvm for an
+            Android from an ISO, or the Android SDK's emulator for the emulator engine:
+            see the README.
+
+            To check the download was built by this repository's release workflow:
+            `gh attestation verify purrdroid-${{ github.ref_name }}-linux-x86_64.tar.gz --repo anti-ghostsec/PurrDroid`

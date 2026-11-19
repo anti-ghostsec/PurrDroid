@@ -1,0 +1,8 @@
+[package]
+name = "purrdroid-rfb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A small VNC (RFB 3.8) client for QEMU's display: raw pixels over a Unix socket, absolute pointer, QEMU's scancode key events"
+
+[dependencies]

@@ -1,0 +1,16 @@
+[package]
+name = "purrdroid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PurrDroid: Android apps on FerroOS, in a virtual machine whose every byte on disk is encrypted"
+
+[dependencies]
+purrdroid-store.workspace = true
+purrdroid-nbd.workspace = true
+purrdroid-adb.workspace = true
+purrdroid-rfb.workspace = true
+vaultkit.workspace = true
+zeroize.workspace = true
+libc.workspace = true
+x11rb = { version = "0.14", default-features = false }

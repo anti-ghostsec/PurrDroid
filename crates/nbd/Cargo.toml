@@ -1,0 +1,9 @@
+[package]
+name = "purrdroid-nbd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PurrDroid's NBD server: hands the encrypted disks to QEMU over a Unix socket"
+
+[dependencies]
+purrdroid-store.workspace = true
