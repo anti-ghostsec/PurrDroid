@@ -263,7 +263,9 @@ into one drag, and never holds the window up.
   in Android's `Download/From FerroOS` and Android's share sheet opens, so
   you pick the app. An `.apk` opens Android's installer instead.
 - **From Android to FerroOS:** save or share a file to `Download/To FerroOS`
-  (Android's Files can). It's moved out of Android into memory and shows
+  (Android's Files can). It's moved out of Android into memory (a big one,
+  a video say, into /dev/shm, which can hold up to half the PC's memory; it
+  waits in Android while that would leave the PC short) and shows
   in the tray along the bottom of the window: drag it onto any window, or
   click it for FerroOS's Share box. The **x** forgets it.
 - **Network:** `purrdroid --net direct` (the default), `--net tor` (every

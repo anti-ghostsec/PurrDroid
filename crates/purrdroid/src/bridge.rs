@@ -28,8 +28,18 @@ use purrdroid_adb::{quote, Adb, Key};
 
 pub const FROM_DIR: &str = "/sdcard/Download/From FerroOS";
 pub const TO_DIR: &str = "/sdcard/Download/To FerroOS";
-/// The biggest file moved out of Android into memory.
-const OUT_LIMIT: u64 = 512 << 20;
+/// Memory left for the rest of the PC when a file comes out of Android.
+const OUT_KEEP: u64 = 600 << 20;
+
+/// Where files too big for the outbox's own filesystem go instead: in
+/// /dev/shm (memory too, and up to half of it), named after the outbox so
+/// a second PurrDroid has its own. Removed with the outbox at the end.
+pub fn big_outbox(outbox: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    outbox.hash(&mut h);
+    PathBuf::from(format!("/dev/shm/purrdroid-out-{}-{:016x}", unsafe { libc::getuid() }, h.finish()))
+}
 
 pub enum Item {
     File { name: String, file: File },
@@ -476,17 +486,33 @@ fn poll_outbox(
             continue;
         }
         let remote = format!("{TO_DIR}/{name}");
-        if size > OUT_LIMIT || size > free_memory(outbox) {
-            // Left where it is; said once.
+        // In memory, wherever it fits: the outbox, or /dev/shm for a big one;
+        // and only while the PC keeps some memory to spare.
+        let _ = std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700).create(outbox);
+        let room = crate::mem_available_mb().saturating_mul(1 << 20).saturating_sub(OUT_KEEP);
+        let fits = |dir: &Path| size + (64 << 20) <= free_memory(dir);
+        let base = if fits(outbox) {
+            Some(outbox.to_path_buf())
+        } else if crate::paths::in_memory(Path::new("/dev/shm")) && fits(Path::new("/dev/shm")) {
+            Some(big_outbox(outbox))
+        } else {
+            None
+        };
+        let Some(base) = base.filter(|_| size <= room) else {
+            // Left where it is, and tried again each round; said once.
             if warned.insert(name.to_string()) {
-                return Err(purrdroid_adb::Error::Failed(format!("{name} is too big to hold in memory ({} MiB)", size >> 20)));
+                return Err(purrdroid_adb::Error::Failed(format!(
+                    "{name} ({} MiB) is still in Android: holding it in memory now would leave the PC short ({} MiB free). Close some programs and it comes out by itself.",
+                    size.div_ceil(1 << 20),
+                    crate::mem_available_mb()
+                )));
             }
             continue;
-        }
-        let dir = unique_dir(outbox).map_err(purrdroid_adb::Error::Io)?;
+        };
+        let dir = unique_dir(&base).map_err(purrdroid_adb::Error::Io)?;
         let path = dir.join(safe_name(name));
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).map_err(purrdroid_adb::Error::Io)?;
-        if let Err(e) = a.pull(&remote, &mut f, OUT_LIMIT) {
+        if let Err(e) = a.pull(&remote, &mut f, size + (1 << 20)) {
             drop(f);
             let _ = std::fs::remove_dir_all(&dir);
             return Err(e);

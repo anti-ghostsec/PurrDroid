@@ -119,7 +119,7 @@ static LOW_MEMORY: AtomicBool = AtomicBool::new(false);
 
 /// Memory the PC could still hand out, in MiB (what's free plus caches it
 /// can drop).
-fn mem_available_mb() -> u64 {
+pub(crate) fn mem_available_mb() -> u64 {
     fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|t| {
@@ -588,6 +588,9 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
     let screen = screen.ok_or("QEMU's screen never came up")?;
     let windowless = args.iter().any(|a| a == "--no-window");
     let outbox = rt.join("outbox");
+    // Files a session killed outright left in memory (this one holds the lock).
+    let _ = fs::remove_dir_all(&outbox);
+    let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
     let (notes_tx, notes_rx) = mpsc::channel();
     let bridge_tx = bridge::start(cfg.adb_port, adb_key, net, outbox.clone(), notes_tx, waker.clone());
     bridge::serve_control(rt.join("control.sock"), bridge_tx.clone())?;
@@ -673,6 +676,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         let _ = fs::remove_file(p);
     }
     let _ = fs::remove_dir_all(&outbox);
+    let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
     eprintln!("purrdroid: Android is off.");
     Ok(())
 }
@@ -862,6 +866,9 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
     }
     let rt = paths::runtime_dir()?;
     let outbox = rt.join("outbox");
+    // Files a session killed outright left in memory (this one holds the lock).
+    let _ = fs::remove_dir_all(&outbox);
+    let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
     let (notes_tx, notes_rx) = mpsc::channel();
     let mut notes_rx = Some(notes_rx);
     let clip_tx = notes_tx.clone();
@@ -1037,6 +1044,7 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
     }
     let _ = fs::remove_file(rt.join("control.sock"));
     let _ = fs::remove_dir_all(&outbox);
+    let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
     let why = emu::log_tail(&ramdir.0);
     if !why.is_empty() && status.map(|s| !s.success()).unwrap_or(true) && !STOP.load(Ordering::Relaxed) {
         fail(&format!("The emulator stopped:\n{why}"));
