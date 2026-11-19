@@ -716,28 +716,36 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
     if args.iter().any(|a| a == "--gpu") {
         v.settings.set("emu_gpu", "host");
     }
-    // Memory: Android's own, about 2 GiB more for the emulator and its
-    // folder in memory (measured with /e/OS), and some left for the rest of
-    // the PC, which has nothing to fall back on without swap. 2 GiB is
-    // plenty for Android unless asked for more.
-    const EMU_EXTRA_MB: u64 = 2048;
-    const PC_KEEP_MB: u64 = 1024;
+    // Memory, all of it from the PC's RAM, as measured with /e/OS and
+    // Wisp open: the emulator's process takes about 3.7 GiB whether
+    // Android is given 1.5 or 2 (it's at least that), or what Android is
+    // given and 1.7 GiB more; then Android's data disk, which is in memory
+    // too and only grows (what Android deletes on it isn't handed back);
+    // and some left for the rest of the PC, which has nothing to fall back
+    // on without swap. What Android touches stays taken until it stops,
+    // even once Android frees it, so it's all counted as in use.
+    const EMU_EXTRA_MB: u64 = 1700;
+    const EMU_LEAST_MB: u64 = 3750;
+    const DATA_GROWTH_MB: u64 = 300;
+    const PC_KEEP_MB: u64 = 600;
+    let state_mb = match (v.settings.get("emu_state"), v.settings.key("emu_key")) {
+        (Some(name), Some(k)) => emu::sealed_size(&dir.join(format!("emulator-{name}.disk")), &k).map_or(600, |b| b >> 20),
+        _ => 600,
+    };
     let asked = flag_value(args, "--ram").is_some() || v.settings.get("ram_mb").is_some();
-    let mut ram = if asked { ram } else { 2048 };
+    // Less than 2 GiB saves nothing (see above), so 2 unless asked.
+    let ram = if asked { ram } else { 2048 };
     let free = mem_available_mb();
-    let fits = |r: u32| u64::from(r) + EMU_EXTRA_MB + PC_KEEP_MB <= free;
-    if !fits(ram) {
-        if !asked && fits(1536) {
-            ram = 1536;
-        } else {
-            return Err(format!(
-                "there isn't enough free memory to start Android without slowing the whole PC down: {free} MiB is free, and it needs about {} MiB ({ram} MiB for Android, {EMU_EXTRA_MB} for the emulator, {PC_KEEP_MB} kept for everything else). Close some programs and try again{}.",
-                u64::from(ram) + EMU_EXTRA_MB + PC_KEEP_MB,
-                if asked { ", or give Android less with --ram" } else { "" }
-            )
-            .into());
-        }
+    let emulator_mb = (u64::from(ram) + EMU_EXTRA_MB).max(EMU_LEAST_MB);
+    let need = emulator_mb + state_mb + DATA_GROWTH_MB + PC_KEEP_MB;
+    if need > free {
+        return Err(format!(
+            "there isn't enough free memory to start Android without slowing the whole PC down: {free} MiB is free, and it needs about {need} MiB ({emulator_mb} MiB for the emulator with Android in it, {} for Android's data, which is kept in memory, and {PC_KEEP_MB} kept for everything else). Close some programs and try again.",
+            state_mb + DATA_GROWTH_MB,
+        )
+        .into());
     }
+    eprintln!("purrdroid: memory: {free} MiB free, about {} MiB of it for Android ({ram} MiB given)", need - PC_KEEP_MB);
     let mut cfg = emu::Config {
         sdk,
         image,
@@ -811,6 +819,7 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
     let vm_done = Arc::new(AtomicBool::new(false));
     {
         let (child, done) = (child.clone(), vm_done.clone());
+        let mut low_for = 0u32;
         thread::spawn(move || loop {
             if !matches!(child.lock().unwrap().try_wait(), Ok(None)) {
                 done.store(true, Ordering::Relaxed);
@@ -827,8 +836,15 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
             }
             // Nearly out of memory (no swap here to slow down into): Android
             // is shut down before the PC freezes.
-            if mem_available_mb() < 400 && !LOW_MEMORY.swap(true, Ordering::Relaxed) {
-                STOP.store(true, Ordering::Relaxed);
+            // Only if it stays that low for two seconds: a moment's dip
+            // (another program starting) passes.
+            if mem_available_mb() < 250 {
+                low_for += 1;
+                if low_for >= 10 && !LOW_MEMORY.swap(true, Ordering::Relaxed) {
+                    STOP.store(true, Ordering::Relaxed);
+                }
+            } else {
+                low_for = 0;
             }
             thread::sleep(Duration::from_millis(200));
         });
