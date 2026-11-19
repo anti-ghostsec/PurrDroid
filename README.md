@@ -273,8 +273,14 @@ into one drag, and never holds the window up.
   `--no-gpu` and `--no-sound`.
 - **Closing the window** shuts Android down properly.
 
-There's no shared clipboard, shared folder, microphone, camera or
-location: nothing crosses unless you send it. Android's serial number,
+- **Copy and paste:** Ctrl+V in PurrDroid's window pastes the desktop's
+  clipboard into Android (on an ISO's Android it's typed in: plain letters,
+  digits and signs only). Text copied in the emulator's Android becomes the
+  desktop's clipboard; Android 11 (BlissOS) gives no way to read its
+  clipboard, so that way it's the emulator only.
+
+There's no shared folder, microphone, camera or location: nothing crosses
+unless you send it or paste it. Android's serial number,
 UUID and network address are random, made once per vault.
 
 ## What it doesn't do yet
