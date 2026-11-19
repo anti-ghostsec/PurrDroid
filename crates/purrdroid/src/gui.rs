@@ -652,7 +652,22 @@ impl Drop for Splash {
 /// Shows a message with an OK button, and waits for it.
 pub fn message(title: &str, text: &str) -> Res<()> {
     let (conn, screen) = x11rb::connect(None)?;
-    let lines: Vec<&str> = text.lines().collect();
+    // Long lines wrapped at word breaks, 80 characters at most.
+    let mut wrapped: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut cur = String::new();
+        for word in line.split(' ') {
+            if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > 80 {
+                wrapped.push(std::mem::take(&mut cur));
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+        }
+        wrapped.push(cur);
+    }
+    let lines: Vec<&str> = wrapped.iter().map(String::as_str).collect();
     let longest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10).clamp(20, 90) as u16;
     let (w, h) = (longest * 6 + 40, lines.len() as u16 * 14 + 80);
     let mask = EventMask::EXPOSURE | EventMask::KEY_PRESS | EventMask::BUTTON_PRESS;

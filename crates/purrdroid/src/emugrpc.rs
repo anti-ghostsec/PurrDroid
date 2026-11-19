@@ -500,6 +500,10 @@ impl Input {
             };
             if notches != 0 && !me.held.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = me.scroll(notches.clamp(-6, 6), x, y);
+                // A pause before the next: two touches close together are a
+                // double tap to Android, which zooms in a browser (Wisp).
+                drop(me);
+                thread::sleep(Duration::from_millis(400));
             }
         });
         Input { inner }
@@ -576,26 +580,28 @@ impl Inner {
 
     /// The emulator gives Android touchscreens but no mouse, so the wheel
     /// goes nowhere as a wheel: `notches` become one slow drag (up the
-    /// screen to go down the page), slow enough not to fling.
+    /// screen to go down the page), slow enough not to fling. Never short:
+    /// a short one is a tap (it pressed buttons and focused text boxes).
+    /// It starts where the pointer is, moved up or down if the drag
+    /// wouldn't fit there, and kept off the screen's top and bottom edges
+    /// (Android's bars, which pull down notifications or go home).
     fn scroll(&self, notches: i64, x: i64, y: i64) -> io::Result<()> {
-        let per = (self.device.1 as i64 / 7).max(80);
-        // Never off the screen: from where the pointer is, as far as fits.
-        let room = if notches > 0 { self.device.1 as i64 - 1 - y } else { y };
-        let len = (per * notches.abs()).min(room.max(0));
-        if len < 8 {
-            return Ok(());
-        }
+        let h = self.device.1 as i64;
+        let (top, bottom) = (h * 15 / 100, h * 85 / 100);
+        let per = (h / 7).max(80);
+        let len = (per * notches.abs()).clamp(h / 10, bottom - top);
         let dir = notches.signum();
-        self.mouse(x, y, 1)?;
-        let steps = 10 + 2 * notches.abs();
+        let start = if dir > 0 { y.min(bottom - len).max(top) } else { y.max(top + len).min(bottom) };
+        let steps = 8 + 2 * notches.abs();
+        self.mouse(x, start, 1)?;
         for i in 1..=steps {
-            thread::sleep(Duration::from_millis(16));
-            self.mouse(x, y + dir * len * i / steps, 1)?;
+            thread::sleep(Duration::from_millis(12));
+            self.mouse(x, start + dir * len * i / steps, 1)?;
         }
         // Held still a moment at the end: a drag, not a fling.
         thread::sleep(Duration::from_millis(60));
-        self.mouse(x, y + dir * len, 1)?;
-        self.mouse(x, y + dir * len, 0)
+        self.mouse(x, start + dir * len, 1)?;
+        self.mouse(x, start + dir * len, 0)
     }
 }
 

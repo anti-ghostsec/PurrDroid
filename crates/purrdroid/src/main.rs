@@ -623,7 +623,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
                 let _ = reader.run(frame, waker);
             });
         }
-        let title = if install { "PurrDroid (installing)" } else { "PurrDroid" };
+        let title = if install { "PurrDroid (installer: close this window once Android is installed)" } else { "PurrDroid" };
         viewer::Viewer {
             frame,
             input: Box::new(input),

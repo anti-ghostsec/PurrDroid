@@ -114,7 +114,9 @@ fn run(port: u16, key: Key, net: Net, outbox: PathBuf, rx: Receiver<Request>, no
                 Err(purrdroid_adb::Error::NotAllowed) => note(Note::Status("Tap Allow on Android's \"Allow USB debugging?\" screen".into())),
                 Err(_) if !told_waiting => {
                     told_waiting = true;
-                    note(Note::Status("Waiting for Android (turn on USB debugging once: see the README)".into()));
+                    note(Note::Status(
+                        "Waiting for Android (turn on USB debugging in Android once: Settings > About, tap Build number 7 times)".into(),
+                    ));
                 }
                 Err(_) => {}
             }
@@ -140,7 +142,7 @@ fn run(port: u16, key: Key, net: Net, outbox: PathBuf, rx: Receiver<Request>, no
                 }
                 None => {
                     pending.push(items);
-                    note(Note::Status("Android isn't connected yet: it'll be sent once it is".into()));
+                    note(Note::Status(format!("{HOW_TO_CONNECT} What you dropped is sent once it is.")));
                 }
             },
             Ok(Request::InstallApks(items, reply)) => match adb.as_mut() {
@@ -152,7 +154,7 @@ fn run(port: u16, key: Key, net: Net, outbox: PathBuf, rx: Receiver<Request>, no
                     let _ = reply.send(text);
                 }
                 None => {
-                    let _ = reply.send("Android isn't connected yet: wait until it has started, and try again".into());
+                    let _ = reply.send(format!("{HOW_TO_CONNECT} Then drop it again."));
                 }
             },
             Ok(Request::Shell(command, reply)) => match adb.as_mut() {
@@ -243,8 +245,15 @@ fn install_apks(a: &mut Adb, items: Vec<Item>) -> (String, bool) {
     (out, false)
 }
 
+/// How to switch Android's side of the bridge on (an Android from an ISO;
+/// the emulator's is on already).
+pub const HOW_TO_CONNECT: &str = "Android isn't connected to PurrDroid yet. Switch it on once, in Android: Settings > About tablet, tap Build number 7 times; then Settings > System > Developer options, turn on USB debugging, and tap Allow when Android asks about PurrDroid's key.";
+
 fn setup(a: &mut Adb, net: Net) -> purrdroid_adb::Result<()> {
     a.shell(&format!("mkdir -p {} {}", quote(FROM_DIR), quote(TO_DIR)))?;
+    // A virtual PC has no battery, so Android on it reads one at 0%: told
+    // it's plugged in and full instead (until Android restarts).
+    a.shell("dumpsys battery | grep -qE 'present: false|level: 0$' && dumpsys battery set ac 1 && dumpsys battery set level 100; true")?;
     // In Tor mode every app is pointed at the proxy; the virtual machine
     // has no other way out, so an app that ignores it simply gets nowhere.
     let proxy = if net == Net::Tor { TOR_PROXY } else { ":0" };

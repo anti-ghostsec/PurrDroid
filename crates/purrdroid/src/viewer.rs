@@ -283,6 +283,7 @@ impl Viewer {
         let mut last_pointer = (0u16, 0u16);
         let mut status = String::new();
         let mut installs: Vec<std::sync::mpsc::Receiver<String>> = Vec::new();
+        let mut told_how = false;
         // Answers to the Privacy button.
         let mut replies: Vec<std::sync::mpsc::Receiver<String>> = Vec::new();
         self.wake.set_nonblocking(true)?;
@@ -614,6 +615,14 @@ impl Viewer {
             for note in self.notes.try_iter() {
                 match note {
                     Note::Status(s) => {
+                        // How to connect: too long for the toolbar, so in a box too (once).
+                        if s.starts_with("Android isn't connected to PurrDroid yet") && !told_how {
+                            told_how = true;
+                            let text = s.clone();
+                            std::thread::spawn(move || {
+                                let _ = gui::message("PurrDroid", &text);
+                            });
+                        }
                         status = s;
                         set_title(&conn, win, net_name, utf8, &format!("{} - {status}", self.title))?;
                         draw_toolbar(ww, net_on, &status)?;
