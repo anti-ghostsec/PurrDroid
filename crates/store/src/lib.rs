@@ -50,11 +50,58 @@ pub fn harden_process() {
     }
 }
 
+/// How much memory this process may lock (keep out of swap), in bytes;
+/// `None` for no limit.
+pub fn memlock_limit() -> Option<u64> {
+    let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut r) } != 0 {
+        return Some(0);
+    }
+    (r.rlim_cur != libc::RLIM_INFINITY).then_some(r.rlim_cur as u64)
+}
+
+/// The most PurrDroid itself ever holds at once (the vault's Argon2id, the
+/// disk server's buffers, a container's block maps), with room to spare.
+const OWN_MEMORY: u64 = 2 << 30;
+
+/// Keeps all of this process's memory, now and from now on, out of swap,
+/// if the memory-lock limit allows that much (it's 8 MiB on most systems,
+/// unless raised); else does nothing, rather than have allocations fail
+/// later. Returns whether it's locked.
+pub fn lock_all_memory() -> bool {
+    if memlock_limit().is_some_and(|l| l < OWN_MEMORY) {
+        return false;
+    }
+    unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) == 0 }
+}
+
 /// Keeps `len` bytes at `ptr` out of swap, as far as the memory-lock limit
 /// allows. Failing is not an error: FerroOS has no disk swap at all.
 pub fn lock_memory(ptr: *const u8, len: usize) {
     #[cfg(unix)]
     unsafe {
         libc::mlock(ptr as *const libc::c_void, len);
+    }
+}
+
+/// True if swap on a disk is in use (/proc/swaps), where memory that isn't
+/// locked can be written out unencrypted (unless the swap itself is
+/// encrypted). Swap in memory (zram) doesn't count.
+pub fn disk_swap_in_use() -> bool {
+    swap_on_disk(&std::fs::read_to_string("/proc/swaps").unwrap_or_default())
+}
+
+fn swap_on_disk(swaps: &str) -> bool {
+    swaps.lines().skip(1).filter_map(|l| l.split_whitespace().next()).any(|dev| !dev.starts_with("/dev/zram"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn swap() {
+        let head = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+        assert!(!super::swap_on_disk(head));
+        assert!(!super::swap_on_disk(&format!("{head}/dev/zram0  partition 4G 0 100\n")));
+        assert!(super::swap_on_disk(&format!("{head}/dev/zram0  partition 4G 0 100\n/swapfile file 2G 0 -2\n")));
     }
 }

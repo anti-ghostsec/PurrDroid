@@ -284,7 +284,8 @@ pub fn setup(images: &[Image]) -> Res<Option<Setup>> {
     let mut ui = Ui::new("Set up PurrDroid", w, h)?;
     let iso = rows as usize;
     let mut choice = if images.is_empty() { iso } else { 0 };
-    let mut fields = [Zeroizing::new(String::new()), Zeroizing::new(String::new())];
+    // Never grown past what they're made with: see gui::TYPED_ROOM.
+    let mut fields = [Zeroizing::new(String::with_capacity(crate::gui::TYPED_ROOM)), Zeroizing::new(String::with_capacity(crate::gui::TYPED_ROOM))];
     let mut focus = 0usize;
     let mut keyfiles: Vec<PathBuf> = Vec::new();
     let mut error = String::new();

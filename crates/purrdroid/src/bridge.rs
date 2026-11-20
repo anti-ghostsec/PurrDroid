@@ -31,14 +31,64 @@ pub const TO_DIR: &str = "/sdcard/Download/To FerroOS";
 /// Memory left for the rest of the PC when a file comes out of Android.
 const OUT_KEEP: u64 = 600 << 20;
 
-/// Where files too big for the outbox's own filesystem go instead: in
-/// /dev/shm (memory too, and up to half of it), named after the outbox so
-/// a second PurrDroid has its own. Removed with the outbox at the end.
-pub fn big_outbox(outbox: &Path) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    outbox.hash(&mut h);
-    PathBuf::from(format!("/dev/shm/purrdroid-out-{}-{:016x}", unsafe { libc::getuid() }, h.finish()))
+/// Where the outbox's twin in /dev/shm is noted (see [`big_outbox`]).
+fn big_outbox_note(outbox: &Path) -> PathBuf {
+    outbox.with_file_name("outbox-big")
+}
+
+/// True if `dir` is a real folder (not a link to one), this user's, that
+/// nobody else may enter.
+fn private_dir_ok(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == unsafe { libc::getuid() } && m.mode() & 0o077 == 0)
+}
+
+/// A new folder at `dir`, private: made here and now (never one that was
+/// there already, which someone else may have put there), and checked.
+fn new_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(dir)?;
+    if !private_dir_ok(dir) {
+        return Err(io::Error::other(format!("{} isn't private", dir.display())));
+    }
+    Ok(())
+}
+
+fn random_name() -> io::Result<String> {
+    let mut r = [0u8; 16];
+    vaultkit::random_bytes(&mut r).map_err(io::Error::from)?;
+    Ok(r.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Where files too big for the outbox's own filesystem go instead: a
+/// folder in /dev/shm (memory too, and up to half of it). /dev/shm is open
+/// to every user, so its name is random (nobody can have made it first and
+/// pointed it elsewhere), it's made private, and where it is is noted in
+/// PurrDroid's own folder, for removing it at the end or after a crash.
+fn big_outbox(outbox: &Path) -> io::Result<PathBuf> {
+    let note = big_outbox_note(outbox);
+    if let Ok(p) = std::fs::read_to_string(&note).map(PathBuf::from) {
+        if p.starts_with("/dev/shm/") && private_dir_ok(&p) {
+            return Ok(p);
+        }
+    }
+    let dir = PathBuf::from(format!("/dev/shm/purrdroid-out-{}", random_name()?));
+    new_private_dir(&dir)?;
+    std::fs::write(&note, dir.as_os_str().as_encoded_bytes())?;
+    Ok(dir)
+}
+
+/// Removes the outbox and its twin in /dev/shm, and what's in them.
+pub fn clean_outbox(outbox: &Path) {
+    let _ = std::fs::remove_dir_all(outbox);
+    let note = big_outbox_note(outbox);
+    if let Ok(p) = std::fs::read_to_string(&note).map(PathBuf::from) {
+        // Only a folder PurrDroid made: never anything a link points to.
+        if p.starts_with("/dev/shm/purrdroid-out-") && private_dir_ok(&p) {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+    let _ = std::fs::remove_file(note);
 }
 
 pub enum Item {
@@ -506,13 +556,15 @@ fn poll_outbox(
         let remote = format!("{TO_DIR}/{name}");
         // In memory, wherever it fits: the outbox, or /dev/shm for a big one;
         // and only while the PC keeps some memory to spare.
-        let _ = std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700).create(outbox);
+        if !private_dir_ok(outbox) {
+            let _ = new_private_dir(outbox);
+        }
         let room = crate::mem_available_mb().saturating_mul(1 << 20).saturating_sub(OUT_KEEP);
         let fits = |dir: &Path| size + (64 << 20) <= free_memory(dir);
         let base = if fits(outbox) {
             Some(outbox.to_path_buf())
         } else if crate::paths::in_memory(Path::new("/dev/shm")) && fits(Path::new("/dev/shm")) {
-            Some(big_outbox(outbox))
+            Some(big_outbox(outbox).map_err(purrdroid_adb::Error::Io)?)
         } else {
             None
         };
@@ -529,7 +581,13 @@ fn poll_outbox(
         };
         let dir = unique_dir(&base).map_err(purrdroid_adb::Error::Io)?;
         let path = dir.join(safe_name(name));
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).map_err(purrdroid_adb::Error::Io)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(purrdroid_adb::Error::Io)?;
         if let Err(e) = a.pull(&remote, &mut f, size + (1 << 20)) {
             drop(f);
             let _ = std::fs::remove_dir_all(&dir);
@@ -553,12 +611,14 @@ fn free_memory(dir: &Path) -> u64 {
     (st.f_bavail as u64).saturating_mul(st.f_frsize as u64)
 }
 
+/// A new private folder in `base` (which must be private itself), under a
+/// random name, for one file.
 fn unique_dir(base: &Path) -> io::Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-    let mut r = [0u8; 8];
-    vaultkit::random_bytes(&mut r).map_err(io::Error::from)?;
-    let dir = base.join(r.iter().map(|b| format!("{b:02x}")).collect::<String>());
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    if !private_dir_ok(base) {
+        return Err(io::Error::other(format!("{} isn't private", base.display())));
+    }
+    let dir = base.join(random_name()?);
+    new_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -782,6 +842,26 @@ mod tests {
         let said = "Failure [INSTALL_FAILED_OLDER_SDK: Failed parse during installPackageLI: /data/app/x.tmp/base.apk (at Binary XML file line #0): Requires newer sdk version #35 (current version is #30)]";
         assert!(explain_install(said).starts_with("not installed: it needs Android 15 or newer; this one is Android 11."));
         assert_eq!(explain_install("Success"), "Success");
+    }
+
+    #[test]
+    fn outbox_folders_are_new_and_private() {
+        let base = std::env::temp_dir().join(format!("pd-out-{}", random_name().unwrap()));
+        new_private_dir(&base).unwrap();
+        assert!(new_private_dir(&base).is_err(), "never one that's there already");
+        let d = unique_dir(&base).unwrap();
+        assert!(private_dir_ok(&d));
+        // A link, even to a private folder, isn't one.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&d, &link).unwrap();
+        assert!(!private_dir_ok(&link));
+        assert!(unique_dir(&link).is_err());
+        // An open folder isn't either.
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert!(unique_dir(&open).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

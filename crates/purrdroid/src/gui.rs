@@ -21,6 +21,9 @@ pub const DARK: u32 = 0x808080;
 pub const BLACK: u32 = 0x000000;
 
 /// The keyboard's mapping, to turn key codes into keysyms and characters.
+/// Bytes a password field holds at most (1024), plus a character's worth.
+pub const TYPED_ROOM: usize = 1024 + 4;
+
 pub struct Keymap {
     min: u8,
     per: usize,
@@ -255,15 +258,15 @@ impl Clipboard {
         if sn.selection != self.clipboard {
             return None;
         }
-        let mut text = Zeroizing::new(String::new());
         if sn.property != x11rb::NONE {
             if let Ok(Ok(r)) = conn.get_property(true, win, self.prop, AtomEnum::ANY, 0, 1 << 14).map(|c| c.reply()) {
                 let bytes = Zeroizing::new(r.value);
                 let s = Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned());
-                text.push_str(s.split(['\n', '\r']).next().unwrap_or(""));
+                // Made to size at once: a string that grows leaves copies.
+                return Some(Zeroizing::new(s.split(['\n', '\r']).next().unwrap_or("").to_string()));
             }
         }
-        Some(text)
+        Some(Zeroizing::new(String::new()))
     }
 }
 
@@ -304,7 +307,9 @@ pub fn ask_password(title: &str, prompt: &str, given: &[PathBuf], offer_reset: b
     conn.map_window(win)?;
     conn.flush()?;
 
-    let mut typed = Zeroizing::new(String::new());
+    // Room for the most that may be typed, so it never grows (growing
+    // would leave a copy behind in freed memory).
+    let mut typed = Zeroizing::new(String::with_capacity(TYPED_ROOM));
     let mut dropped: Vec<PathBuf> = Vec::new();
     let mut incoming = None;
     let mut show = false;
@@ -553,7 +558,11 @@ pub fn confirm_reset() -> Res<bool> {
             }
             Event::SelectionNotify(sn) => {
                 if let Some(t) = clip.read(&conn, win, &sn) {
-                    typed.push_str(t.chars().take(20).collect::<String>().as_str());
+                    for c in t.chars().take(20) {
+                        if typed.len() < 20 {
+                            typed.push(c);
+                        }
+                    }
                     draw(&typed)?;
                 }
             }

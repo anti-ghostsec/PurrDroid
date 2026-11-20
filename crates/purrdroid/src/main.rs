@@ -83,6 +83,11 @@ fn fail(msg: &str) {
     }
 }
 
+/// The longest password read from a terminal or stdin, in bytes. Buffers
+/// for it are made this big from the start: one that grows is copied, and
+/// the old copy stays in freed memory.
+const LINE_ROOM: usize = 4096;
+
 /// Reads a line from the terminal without showing it.
 fn read_hidden(prompt: &str) -> io::Result<Zeroizing<String>> {
     let tty = fs::OpenOptions::new().read(true).write(true).open("/dev/tty")?;
@@ -96,12 +101,14 @@ fn read_hidden(prompt: &str) -> io::Result<Zeroizing<String>> {
     quiet.c_lflag |= libc::ECHONL;
     unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
     (&tty).write_all(prompt.as_bytes())?;
-    let mut line = Zeroizing::new(Vec::new());
+    // Never grown (see LINE_ROOM): what's typed past it is left out.
+    let mut line = Zeroizing::new(Vec::with_capacity(LINE_ROOM));
     let mut b = [0u8; 1];
     let res = loop {
         match (&tty).read(&mut b) {
             Ok(0) => break Ok(()),
             Ok(_) if b[0] == b'\n' => break Ok(()),
+            Ok(_) if line.len() >= LINE_ROOM => {}
             Ok(_) => line.push(b[0]),
             Err(e) => break Err(e),
         }
@@ -144,12 +151,20 @@ fn flag_paths(args: &[String], name: &str) -> Vec<PathBuf> {
 /// they come back with it, added to `keyfiles`.
 fn ask(prompt: &str, keyfiles: &mut Vec<PathBuf>) -> Res<Zeroizing<String>> {
     if PASSWORD_STDIN.load(Ordering::Relaxed) {
-        let mut line = Zeroizing::new(String::new());
-        if io::stdin().read_line(&mut line)? == 0 {
+        // Made big enough at once (a string that grows leaves copies of
+        // what it held in freed memory), and read a byte at a time so
+        // nothing past the line is taken from stdin.
+        let mut line = Zeroizing::new(Vec::with_capacity(LINE_ROOM));
+        let mut b = [0u8; 1];
+        let mut stdin = io::stdin().lock();
+        while line.len() < LINE_ROOM && stdin.read(&mut b)? == 1 && b[0] != b'\n' {
+            line.push(b[0]);
+        }
+        if line.is_empty() && b[0] != b'\n' {
             return Err("--password-stdin: no password on stdin".into());
         }
-        let trimmed = Zeroizing::new(line.trim_end_matches(['\n', '\r']).to_string());
-        return Ok(trimmed);
+        let text = std::str::from_utf8(&line).map_err(|_| "--password-stdin: the password isn't UTF-8")?;
+        return Ok(Zeroizing::new(text.trim_end_matches('\r').to_string()));
     }
     if interactive() && !GUI.load(Ordering::Relaxed) {
         Ok(read_hidden(&format!("{prompt}: "))?)
@@ -513,7 +528,6 @@ fn take_lock() -> Res<File> {
 }
 
 fn cmd_run(args: &[String], install: bool) -> Res<()> {
-    purrdroid_store::harden_process();
     let _lock = take_lock()?;
     let mut v = unlock(args)?;
     run_unlocked(args, &mut v, install)
@@ -660,7 +674,11 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
 
     let tor = if net == Net::Tor { Some(tor::start(&rt, v.settings.get("tor_guards"))?) } else { None };
     let adb_key = purrdroid_adb::Key::from_der(&unhex(v.settings.get("adb_key").ok_or("the vault has no adb key")?).ok_or("bad adb key")?)?;
+    // Android's memory kept out of swap too, if the limit allows it all.
+    let mem_lock = purrdroid_store::memlock_limit().is_none_or(|l| l >= (u64::from(ram) + 1024) << 20);
+    warn_swap(v, mem_lock)?;
     let mut cfg = vm::Config {
+        mem_lock,
         ram_mb: ram,
         cpus,
         width,
@@ -709,8 +727,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
     let windowless = args.iter().any(|a| a == "--no-window");
     let outbox = rt.join("outbox");
     // Files a session killed outright left in memory (this one holds the lock).
-    let _ = fs::remove_dir_all(&outbox);
-    let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
+    bridge::clean_outbox(&outbox);
     let (notes_tx, notes_rx) = mpsc::channel();
     let bridge_tx = bridge::start(cfg.adb_port, adb_key, net, airplane(v, net)?, outbox.clone(), notes_tx, waker.clone());
     bridge::serve_control(rt.join("control.sock"), bridge_tx.clone())?;
@@ -801,8 +818,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         }
     }
     let _ = fs::remove_file(rt.join("control.sock"));
-    let _ = fs::remove_dir_all(&outbox);
-    let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
+    bridge::clean_outbox(&outbox);
     eprintln!("purrdroid: Android is off.");
     Ok(())
 }
@@ -887,6 +903,8 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
         .into());
     }
     eprintln!("purrdroid: memory: {free} MiB free, about {} MiB of it for Android ({ram} MiB given)", need - PC_KEEP_MB);
+    // The emulator's memory and Android's state in /dev/shm can't be locked.
+    warn_swap(v, false)?;
     let mut cfg = emu::Config {
         sdk,
         image,
@@ -993,8 +1011,7 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
     let rt = paths::runtime_dir()?;
     let outbox = rt.join("outbox");
     // Files a session killed outright left in memory (this one holds the lock).
-    let _ = fs::remove_dir_all(&outbox);
-    let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
+    bridge::clean_outbox(&outbox);
     let (notes_tx, notes_rx) = mpsc::channel();
     let mut notes_rx = Some(notes_rx);
     let clip_tx = notes_tx.clone();
@@ -1169,8 +1186,7 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
         fail("PurrDroid shut Android down: the PC was nearly out of memory. Close some programs before starting it again.");
     }
     let _ = fs::remove_file(rt.join("control.sock"));
-    let _ = fs::remove_dir_all(&outbox);
-    let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
+    bridge::clean_outbox(&outbox);
     let why = emu::log_tail(&ramdir.0);
     if !why.is_empty() && status.map(|s| !s.success()).unwrap_or(true) && !STOP.load(Ordering::Relaxed) {
         fail(&format!("The emulator stopped:\n{why}"));
@@ -1278,7 +1294,6 @@ fn sdk_images(sdk: &Path) -> Vec<panel::Image> {
 
 fn gui_main() -> Res<()> {
     GUI.store(true, Ordering::Relaxed);
-    purrdroid_store::harden_process();
     let _lock = take_lock()?;
     let f = paths::files()?;
     OFFER_RESET.store(true, Ordering::Relaxed);
@@ -1595,7 +1610,41 @@ fn usage() {
     }
 }
 
+/// PurrDroid's own memory is kept out of swap (see `main`).
+static MEMORY_LOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Says, when swap on a disk is in use, what of PurrDroid's might be
+/// written to it: in the terminal each time, in a box once per vault.
+fn warn_swap(v: &mut Vault, qemu_locked: bool) -> Res<()> {
+    if !purrdroid_store::disk_swap_in_use() {
+        return Ok(());
+    }
+    let what = match (MEMORY_LOCKED.load(Ordering::Relaxed), qemu_locked) {
+        (true, true) => return Ok(()),
+        (true, false) => "Android's memory",
+        (false, true) => "PurrDroid's keys",
+        (false, false) => "Android's memory and PurrDroid's keys",
+    };
+    let msg = format!(
+        "This PC swaps to a disk, so {what} may be written to it, unencrypted unless the swap is. Turn swap off (or encrypt it), or raise the memory-lock limit (ulimit -l, or memlock in /etc/security/limits.conf) above Android's memory plus 2 GiB so PurrDroid can keep it all out of swap."
+    );
+    if GUI.load(Ordering::Relaxed) {
+        if v.settings.get("swap_warned") != Some("yes") {
+            gui::message("PurrDroid: swap", &msg)?;
+            v.settings.set("swap_warned", "yes");
+            v.save()?;
+        }
+    } else {
+        eprintln!("purrdroid: {msg}");
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
+    // Every command handles keys or passwords: no core dumps, no tracing
+    // by other programs, and (if the limit allows) nothing in swap.
+    purrdroid_store::harden_process();
+    MEMORY_LOCKED.store(purrdroid_store::lock_all_memory(), Ordering::Relaxed);
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--password-stdin") {
         args.remove(i);

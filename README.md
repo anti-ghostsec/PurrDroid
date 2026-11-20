@@ -69,10 +69,27 @@ computer, quantum or not. The weak point is the password: pick a long one,
 or add a keyfile.
 
 Everything that isn't encrypted is in memory: the decrypted sectors (they
-go straight from PurrDroid to QEMU over a socket pair), Android's RAM (no swap
-file; PurrDroid and its keys can't be read by other programs or dumped),
+go straight from PurrDroid to QEMU over a socket pair), Android's RAM,
 Tor's state (apart from its guards, which are kept sealed in the vault),
-and files on their way in or out.
+and files on their way in or out. Every PurrDroid command makes itself
+impossible to dump or trace (no core dumps, not readable by other programs
+of yours) before it asks for a password.
+
+**Swap:** memory in RAM can still be swapped out to a disk. FerroOS has no
+disk swap; on a PC that has, PurrDroid says so when Android starts. If the
+memory-lock limit allows (`ulimit -l`, or `memlock` in
+`/etc/security/limits.conf`: 2 GiB for PurrDroid itself, Android's memory
+plus 1 GiB for QEMU, or `unlimited`), PurrDroid locks its own memory and has
+QEMU lock Android's (`-overcommit mem-lock=on`; memory Android frees then
+isn't handed back to the PC while it runs). With the usual 8 MiB limit
+neither is locked, and only swap that's off or encrypted keeps them off the
+disk. Swap in memory (zram) is fine. The emulator engine's memory, and
+Android's state while it's in `/dev/shm`, can't be locked.
+
+**Passwords** are read into buffers made big enough at the start (a buffer
+that grows leaves a copy behind) and wiped afterwards. Pasting a password
+into the password box works, but the desktop's clipboard (and any
+clipboard manager) keeps its own copy: clear it afterwards.
 
 ### Keyfiles
 

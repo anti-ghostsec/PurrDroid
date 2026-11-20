@@ -12,7 +12,8 @@
 //! What the virtual machine is given: a disk, a screen (virtio GPU, with
 //! 3D through virgl when there's a render node), a tablet-style pointer, a
 //! keyboard, sound out (no microphone), a random number source, memory
-//! ballooning (memory Android frees goes back to FerroOS) and, depending on
+//! ballooning (memory Android frees goes back to FerroOS, unless Android's
+//! memory is locked out of swap) and, depending on
 //! the network mode, a network card behind QEMU's user-mode NAT. Its serial
 //! number, UUID and network card address are random, made once per vault:
 //! nothing about this PC. They're handed to QEMU in files it reads from
@@ -36,6 +37,9 @@ use std::time::Duration;
 use crate::bridge::Net;
 
 pub struct Config {
+    /// Android's memory kept out of swap (`-overcommit mem-lock=on`): only
+    /// when the memory-lock limit allows all of it, or QEMU won't start.
+    pub mem_lock: bool,
     pub ram_mb: u32,
     pub cpus: u32,
     pub width: u32,
@@ -284,6 +288,9 @@ fn command(c: &Config, fds: &Passed) -> Command {
     // The host's processor, for KVM's speed, under QEMU's generic name.
     a(&mut q, &["-machine", "q35,accel=kvm,dump-guest-core=off,mem-merge=off", "-cpu", "host,model-id=QEMU Virtual CPU version 2.5+"]);
     q.arg("-smp").arg(c.cpus.to_string()).arg("-m").arg(c.ram_mb.to_string());
+    if c.mem_lock {
+        a(&mut q, &["-overcommit", "mem-lock=on"]);
+    }
     // Spawning is needed only for Tor mode's relay.
     let spawn = if c.net == Net::Tor { "allow" } else { "deny" };
     q.arg("-sandbox").arg(format!("on,obsolete=deny,elevateprivileges=deny,spawn={spawn},resourcecontrol=deny"));
@@ -321,7 +328,12 @@ fn command(c: &Config, fds: &Passed) -> Command {
     // there is (QMP's add_client), see [`Vm::screen`].
     a(&mut q, &["-vnc", "none"]);
     a(&mut q, &["-device", "qemu-xhci", "-device", "usb-tablet", "-device", "usb-kbd"]);
-    a(&mut q, &["-device", "virtio-rng-pci", "-device", "virtio-balloon-pci,free-page-reporting=on"]);
+    a(&mut q, &["-device", "virtio-rng-pci"]);
+    // Memory Android frees goes back to the PC, unless it's locked (locked
+    // memory can't be handed back).
+    if !c.mem_lock {
+        a(&mut q, &["-device", "virtio-balloon-pci,free-page-reporting=on"]);
+    }
 
     // Sound out only: Android gets no microphone.
     if let Some(backend) = c.sound.then(audio_backend).flatten() {
@@ -661,6 +673,7 @@ mod tests {
     #[test]
     fn identity_stays_off_the_command_line() {
         let c = Config {
+            mem_lock: false,
             ram_mb: 2048,
             cpus: 2,
             width: 800,
