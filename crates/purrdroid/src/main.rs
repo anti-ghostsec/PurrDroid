@@ -696,7 +696,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         tor_socks: tor.as_ref().map(|t| t.socks.clone()),
     };
 
-    eprintln!("purrdroid: starting Android ({} MiB, {} CPUs, network {})...", cfg.ram_mb, cfg.cpus, net.name());
+    eprintln!("purrdroid: starting Android ({} MiB, {} CPUs)...", cfg.ram_mb, cfg.cpus);
     let vm::Vm { child, mut qmp, net: net_helper } = vm::start(&mut cfg, &mut |conn| {
         let exports = exports.clone();
         thread::spawn(move || purrdroid_nbd::serve_stream(conn, &exports));
@@ -942,7 +942,7 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
     emu::trust_key(&ramdir.0, &adb_key.public_string())?;
     let console = emu::free_ports()?;
 
-    eprintln!("purrdroid: starting Android in the emulator ({} MiB, {} CPUs, network {})...", cfg.ram_mb, cfg.cpus, net.name());
+    eprintln!("purrdroid: starting Android in the emulator ({} MiB, {} CPUs)...", cfg.ram_mb, cfg.cpus);
     // Something on screen until Android's own window opens.
     let windowed = !(cfg.window || args.iter().any(|a| a == "--no-window")) && std::env::var_os("DISPLAY").is_some();
     let mut splash = windowed.then(|| gui::Splash::show("PurrDroid", "Starting Android... (a minute or two the first time)"));
@@ -1349,7 +1349,8 @@ fn gui_main() -> Res<()> {
             let mut import = |iso: &Path, progress: &std::sync::atomic::AtomicU64| -> Res<()> {
                 import_iso(&mut v, iso, progress).map_err(|e| e.to_string().into())
             };
-            match panel::get_android(has_iso, installed, &mut import)? {
+            let mut wipe = |iso: &Path| -> Res<()> { overwrite_and_remove(iso).map_err(Into::into) };
+            match panel::get_android(has_iso, installed, &mut import, &mut wipe)? {
                 panel::Next::Quit => return Ok(()),
                 panel::Next::Install => {
                     // The installer's own defaults skip its boot loader: what to
@@ -1640,6 +1641,16 @@ fn warn_swap(v: &mut Vault, qemu_locked: bool) -> Res<()> {
     Ok(())
 }
 
+/// Points stdout and stderr at /dev/null.
+fn quiet_output() {
+    if let Ok(null) = fs::OpenOptions::new().write(true).open("/dev/null") {
+        unsafe {
+            libc::dup2(null.as_raw_fd(), 1);
+            libc::dup2(null.as_raw_fd(), 2);
+        }
+    }
+}
+
 fn main() -> ExitCode {
     // Every command handles keys or passwords: no core dumps, no tracing
     // by other programs, and (if the limit allows) nothing in swap.
@@ -1657,6 +1668,12 @@ fn main() -> ExitCode {
         Some(c) if c.starts_with("--") && c != "--help" => ("run", &args[..]),
         Some(c) => (c, &args[1..]),
     };
+    // Started from the Start menu or Share, what PurrDroid (and QEMU, Tor,
+    // the emulator) would print goes to the session's log or the journal,
+    // kept on the disk: nowhere instead. What goes wrong is shown in a box.
+    if cmd == "gui" || std::env::var_os("PURRDROID_NO_LOG").is_some() {
+        quiet_output();
+    }
     let res = match cmd {
         "init" => cmd_init(rest),
         "import" => cmd_import(rest),

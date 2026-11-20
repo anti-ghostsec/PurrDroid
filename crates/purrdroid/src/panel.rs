@@ -418,14 +418,24 @@ pub enum Next {
 /// whether one was imported already; `import` encrypts a dropped ISO into
 /// the store, counting bytes done into the counter (it's run on its own
 /// thread while the window shows the progress).
-pub fn get_android(mut has_iso: bool, installed: bool, import: &mut (dyn FnMut(&Path, &AtomicU64) -> Res<()> + Send)) -> Res<Next> {
-    let (w, h) = (520u16, 300u16);
+/// `wipe` writes over and removes the ISO that was dropped (the original,
+/// once it's encrypted into the store), when the person asks.
+pub fn get_android(
+    mut has_iso: bool,
+    installed: bool,
+    import: &mut (dyn FnMut(&Path, &AtomicU64) -> Res<()> + Send),
+    wipe: &mut dyn FnMut(&Path) -> Res<()>,
+) -> Res<Next> {
+    let (w, h) = (520u16, 330u16);
     let mut ui = Ui::new("PurrDroid: get Android", w, h)?;
     let area = R { x: 16, y: 60, w: w - 32, h: 110 };
     let install = R { x: 16, y: h as i16 - 44, w: 170, h: 28 };
     let start = R { x: 196, y: h as i16 - 44, w: 200, h: 28 };
     let quit = R { x: w as i16 - 106, y: h as i16 - 44, w: 90, h: 28 };
+    let wipe_button = R { x: 16, y: 240, w: 240, h: 26 };
     let mut message = String::new();
+    // The original ISO, once it's encrypted: offered for wiping.
+    let mut original: Option<std::path::PathBuf> = None;
     loop {
         ui.clear()?;
         ui.text(16, 14, "Android isn't installed yet. Get a BlissOS ISO (x86_64) from its")?;
@@ -438,6 +448,9 @@ pub fn get_android(mut has_iso: bool, installed: bool, import: &mut (dyn FnMut(&
         for (i, l) in wrap(&message, 80).iter().enumerate().take(3) {
             ui.text_color(16, 182 + i as i16 * 16, RED, l)?;
         }
+        if original.is_some() {
+            ui.button(wipe_button, "Wipe the original ISO", true)?;
+        }
         ui.button(install, "Install Android", has_iso)?;
         // Nothing to start until the installer has run.
         ui.button(start, "It's installed: start it", installed)?;
@@ -448,6 +461,16 @@ pub fn get_android(mut has_iso: bool, installed: bool, import: &mut (dyn FnMut(&
             Ev::Click { x, y } if install.hit(x, y) && has_iso => return Ok(Next::Install),
             Ev::Click { x, y } if start.hit(x, y) && installed => return Ok(Next::Start),
             Ev::Click { x, y } if quit.hit(x, y) => return Ok(Next::Quit),
+            Ev::Click { x, y } if wipe_button.hit(x, y) && original.is_some() => {
+                let iso = original.take().unwrap();
+                ui.clear()?;
+                ui.text(16, 14, "Writing over the original ISO...")?;
+                ui.flush()?;
+                message = match wipe(&iso) {
+                    Ok(()) => format!("Wrote over and removed {}.", iso.display()),
+                    Err(e) => format!("Couldn't wipe {}: {e}", iso.display()),
+                };
+            }
             Ev::Drop(Dropped::Files(files)) => {
                 let Some(iso) = files.into_iter().next() else { continue };
                 let total = std::fs::metadata(&iso).map(|m| m.len()).unwrap_or(1).max(1);
@@ -476,9 +499,10 @@ pub fn get_android(mut has_iso: bool, installed: bool, import: &mut (dyn FnMut(&
                     Ok(()) => {
                         has_iso = true;
                         message = format!(
-                            "Encrypted {} (you can delete the original). Next: press Install Android, and pick Installation in its menu.",
+                            "Encrypted {}. The original is still where it was: Wipe writes over it and removes it. Next: press Install Android, and pick Installation in its menu.",
                             iso.file_name().unwrap_or_default().to_string_lossy()
                         );
+                        original = Some(iso);
                     }
                     Err(e) => message = format!("Couldn't import it: {e}"),
                 }

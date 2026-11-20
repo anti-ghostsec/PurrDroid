@@ -40,24 +40,27 @@ Type=Application
 Name=PurrDroid
 GenericName=Android Apps
 Comment=Android in an encrypted virtual machine
-Exec=$BIN/purrdroid gui
+Exec=env PURRDROID_NO_LOG=1 $BIN/purrdroid gui
 Icon=purrdroid
 Terminal=false
 Categories=System;Emulator;
 X-Ferro-Share=false
 DESK
 
-# What FerroOS's Share box offers as "Android (PurrDroid)": anything goes.
+# What FerroOS's Share box offers as "Android (PurrDroid)": apps, pictures,
+# videos, music, PDFs and plain text, not every file there is (a key, a
+# database or a document sent by mistake). Anything else can still be
+# dropped on the window. Nothing it prints is kept in the session's log.
 cat > "$APPS/purrdroid-send.desktop" <<DESK
 [Desktop Entry]
 Type=Application
 Name=Android (PurrDroid)
 Comment=Send to an app in Android
-Exec=$BIN/purrdroid send %F
+Exec=env PURRDROID_NO_LOG=1 $BIN/purrdroid send %F
 Icon=purrdroid
 Terminal=false
 NoDisplay=true
-MimeType=image/*;video/*;audio/*;text/*;application/*;
+MimeType=application/vnd.android.package-archive;image/*;video/*;audio/*;application/pdf;text/plain;
 DESK
 
 update-desktop-database "$APPS" 2>/dev/null || true

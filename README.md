@@ -30,7 +30,8 @@ memory. Written in Rust.
   Its ISO is imported into PurrDroid's encrypted storage and installed from
   there, and wiped once Android starts from its own disk. The ISO you
   downloaded stays where it was unless you have PurrDroid overwrite it
-  (`import --remove`).
+  (`import --remove`, or *Wipe the original ISO* in the window once it's
+  imported).
 - **QEMU's disks, screen and control** each come over a socket pair
   PurrDroid makes and hands it already connected: there's no socket file
   anywhere that another program could open to read the decrypted disk, see
@@ -196,7 +197,8 @@ terminal needed:
      Google Play or microG.
 2. **The password box** each time after that: drop keyfiles on it too.
 3. For an ISO: **get Android**: drop the ISO on the window (it's encrypted
-   into the store, with a progress bar), click **Install Android** and pick
+   into the store, with a progress bar; *Wipe the original ISO* then writes
+   over the one you downloaded and removes it), click **Install Android** and pick
    *Installation* in its boot menu; when it's done, **It's installed: start
    it**.
 4. While Android runs: drop APKs on PurrDroid's window to install them, and
@@ -348,6 +350,13 @@ into one drag, and never holds the window up.
     chances to pick a bad one. They're the same relays every session, which
     is how Tor is meant to work.
 - **Closing the window** shuts Android down properly.
+- **Nothing in the logs:** started from the Start menu or the Share box,
+  PurrDroid (and QEMU, Tor and the emulator under it) prints nowhere, so
+  nothing about when it ran, which network or which files ends up in the
+  session's log or the journal; problems are shown in a box. From a
+  terminal it prints there as usual. The Share box offers *Android
+  (PurrDroid)* for apps, pictures, videos, music, PDFs and plain text only;
+  anything else can be dropped on the window.
 
 - **Copy and paste:** Ctrl+V in PurrDroid's window pastes the desktop's
   clipboard into Android (on an ISO's Android it's typed in: plain letters,
