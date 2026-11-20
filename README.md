@@ -213,7 +213,7 @@ system permissions):
 purrdroid init --emulator [--sdk ~/.local/opt/android-sdk] [--keyfile PATH]
 purrdroid                                # its own window; --no-window for none
 purrdroid apk AnonSecureFolder.apk AnonPrivacy.apk
-purrdroid shell 'su 0 am start -n app.anonphene.securefolder/.FolderActivity'
+echo 'su 0 am start -n app.anonphene.securefolder/.FolderActivity' | purrdroid shell -
 ```
 
 **/e/OS, the most private choice.** e Foundation publishes x86_64 emulator
@@ -290,7 +290,9 @@ into one drag, and never holds the window up.
 
 - **From FerroOS to Android:** drop files or text on PurrDroid's window,
   or pick *Android (PurrDroid)* in FerroOS's Share box, or
-  `purrdroid send FILE...` / `purrdroid send --text "..."`. The files land
+  `purrdroid send FILE...` / `printf %s "..." | purrdroid send --text -`
+  (text from stdin: what's on a command line can be read by any program on
+  the PC while it runs; `--text "..."` works too). The files land
   in Android's `Download/From FerroOS` and Android's share sheet opens, so
   you pick the app. An `.apk` opens Android's installer instead.
 - **From Android to FerroOS:** save or share a file to `Download/To FerroOS`
@@ -314,7 +316,12 @@ into one drag, and never holds the window up.
 
 There's no shared folder, microphone, camera or location: nothing crosses
 unless you send it or paste it. Android's serial number,
-UUID and network address are random, made once per vault.
+UUID and network address are random, made once per vault, and handed to
+QEMU through descriptors rather than on its command line (which other
+programs can read); the virtual PC's maker and processor name are QEMU's
+generic ones. The processor's features are this PC's (`-cpu host`, which
+KVM needs to be fast), so an app can still see what kind of processor it
+is.
 
 ## What it doesn't do yet
 

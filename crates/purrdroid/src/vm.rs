@@ -15,7 +15,14 @@
 //! ballooning (memory Android frees goes back to FerroOS) and, depending on
 //! the network mode, a network card behind QEMU's user-mode NAT. Its serial
 //! number, UUID and network card address are random, made once per vault:
-//! nothing about this PC.
+//! nothing about this PC. They're handed to QEMU in files it reads from
+//! descriptors it inherits (the serial number and UUID as a ready-made
+//! SMBIOS table, `-smbios file=/dev/fd/N`; the network card and the network
+//! in a configuration file, `-readconfig /dev/fd/N`), never on its command
+//! line, which every program on the PC can read in /proc. Nothing else there says
+//! it's PurrDroid's either: the machine's maker is QEMU's own default, and
+//! the processor's name is QEMU's generic one (its features are still this
+//! PC's: `-cpu host` is what makes Android fast under KVM).
 
 use std::io::{self, BufRead, BufReader};
 use std::os::fd::{AsRawFd, RawFd};
@@ -55,6 +62,109 @@ struct Passed {
     qmp: RawFd,
     android: RawFd,
     media: Option<RawFd>,
+    /// The read end of a pipe holding [`identity_config`], or `None` to
+    /// put it on the command line after all (see [`start`]).
+    config: Option<RawFd>,
+    /// A file in memory holding [`smbios_table`].
+    smbios: RawFd,
+}
+
+/// The SMBIOS "system" table (type 1) Android reads its serial number and
+/// UUID from, as QEMU would make it: QEMU's maker and product name, this
+/// vault's serial number and UUID.
+fn smbios_table(serial: &str, uuid: &str) -> io::Result<Vec<u8>> {
+    let hex: String = uuid.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || serial.contains('\0') || serial.is_empty() {
+        return Err(io::Error::other("the vault's machine identity is damaged"));
+    }
+    let mut id = [0u8; 16];
+    for (i, b) in id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| io::Error::other("the vault's UUID is damaged"))?;
+    }
+    // SMBIOS 2.6 and later: the first three fields little-endian.
+    id[..4].reverse();
+    id[4..6].reverse();
+    id[6..8].reverse();
+    // Type 1, 27 bytes, handle 0x100 (QEMU's own for it); strings 1, 2 and 3
+    // are the maker, product and serial number; no version; woken by the
+    // power switch (6); no SKU or family.
+    let mut t = vec![1u8, 27, 0x00, 0x01, 1, 2, 0, 3];
+    t.extend_from_slice(&id);
+    t.extend_from_slice(&[6, 0, 0]);
+    for s in ["QEMU", "Standard PC (Q35 + ICH9, 2009)", serial] {
+        t.extend_from_slice(s.as_bytes());
+        t.push(0);
+    }
+    t.push(0);
+    Ok(t)
+}
+
+/// A file in memory (no name anywhere) holding `bytes`, for QEMU to read
+/// by its descriptor.
+fn memory_file(bytes: &[u8]) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let fd = unsafe { libc::memfd_create(c"purrdroid".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    std::os::unix::fs::FileExt::write_all_at(&std::fs::File::from(fd.try_clone()?), bytes, 0)?;
+    Ok(fd)
+}
+
+/// The network card (its address tells this Android apart) and the
+/// network (which in Tor mode names PurrDroid's folder and program), in
+/// QEMU's configuration file format.
+fn identity_config(c: &Config) -> io::Result<String> {
+    let mut out = String::new();
+    let mut group = |name: &str, entries: &[(&str, &str)]| -> io::Result<()> {
+        out.push_str(name);
+        out.push('\n');
+        for (k, v) in entries {
+            if v.contains(['"', '\n']) || v.len() > 1000 {
+                return Err(io::Error::other(format!("can't hand QEMU this setting: {k}")));
+            }
+            out.push_str(&format!("  {k} = \"{v}\"\n"));
+        }
+        out.push('\n');
+        Ok(())
+    };
+    let (hostfwd, guestfwd) = slirp_forwards(c);
+    let mut net = vec![("type", "user"), ("ipv6", "off"), ("hostfwd", hostfwd.as_str())];
+    if c.net != Net::Direct {
+        net.push(("restrict", "on"));
+    }
+    if let Some(g) = &guestfwd {
+        net.push(("guestfwd", g.as_str()));
+    }
+    group("[netdev \"net0\"]", &net)?;
+    // romfile empty: no network boot firmware, nothing to boot from there.
+    group("[device \"nic\"]", &[("driver", "virtio-net-pci"), ("netdev", "net0"), ("mac", &c.mac), ("romfile", "")])?;
+    Ok(out)
+}
+
+/// The user-mode network's forwards: adb's port in from 127.0.0.1 only,
+/// and in Tor mode the relay out.
+fn slirp_forwards(c: &Config) -> (String, Option<String>) {
+    let hostfwd = format!("tcp:127.0.0.1:{}-:5555", c.adb_port);
+    let guestfwd = (c.net == Net::Tor).then(|| {
+        let socks = c.tor_socks.as_ref().expect("Tor started");
+        format!("tcp:{}-cmd:{} relay {}", crate::bridge::TOR_PROXY, c.exe.display(), socks.display())
+    });
+    (hostfwd, guestfwd)
+}
+
+/// [`identity_config`] in a pipe, its read end for QEMU.
+fn config_pipe(text: &str) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut ends = [0; 2];
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (r, w) = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    // A few hundred bytes: far less than a pipe holds, so this never waits.
+    io::Write::write_all(&mut std::fs::File::from(w), text.as_bytes())?;
+    Ok(r)
 }
 
 fn render_node() -> Option<PathBuf> {
@@ -84,7 +194,8 @@ fn command(c: &Config, fds: &Passed) -> Command {
         q.args(args);
     };
     a(&mut q, &["-name", "PurrDroid,process=purrdroid-vm", "-nodefaults", "-no-user-config"]);
-    a(&mut q, &["-machine", "q35,accel=kvm,dump-guest-core=off,mem-merge=off", "-cpu", "host"]);
+    // The host's processor, for KVM's speed, under QEMU's generic name.
+    a(&mut q, &["-machine", "q35,accel=kvm,dump-guest-core=off,mem-merge=off", "-cpu", "host,model-id=QEMU Virtual CPU version 2.5+"]);
     q.arg("-smp").arg(c.cpus.to_string()).arg("-m").arg(c.ram_mb.to_string());
     // Spawning is needed only for Tor mode's relay.
     let spawn = if c.net == Net::Tor { "allow" } else { "deny" };
@@ -94,8 +205,10 @@ fn command(c: &Config, fds: &Passed) -> Command {
     // of a connection that's already there.
     q.arg("-chardev").arg(format!("socket,id=qmp,fd={}", fds.qmp));
     a(&mut q, &["-mon", "chardev=qmp,mode=control"]);
-    q.arg("-smbios").arg(format!("type=1,manufacturer=PurrDroid,product=Virtual Android,serial={}", c.serial));
-    q.arg("-uuid").arg(&c.uuid);
+    q.arg("-smbios").arg(format!("file=/dev/fd/{}", fds.smbios));
+    if let Some(fd) = fds.config {
+        q.arg("-readconfig").arg(format!("/dev/fd/{fd}"));
+    }
     a(&mut q, &["-rtc", "base=utc"]);
 
     // Disks, from PurrDroid's NBD server, each over its own connection.
@@ -131,21 +244,23 @@ fn command(c: &Config, fds: &Passed) -> Command {
 
     // Network: adb's port (on 127.0.0.1 only) always; the internet in
     // direct mode; only Tor's relay in Tor mode; nothing more in off mode.
-    let mut net = format!("user,id=net0,ipv6=off,hostfwd=tcp:127.0.0.1:{}-:5555", c.adb_port);
-    match c.net {
-        Net::Direct => {}
-        Net::Off => net.push_str(",restrict=on"),
-        Net::Tor => {
-            let socks = c.tor_socks.as_ref().expect("Tor started");
-            net.push_str(&format!(",restrict=on,guestfwd=tcp:{}-cmd:{} relay {}", crate::bridge::TOR_PROXY, c.exe.display(), socks.display()));
+    // In the configuration from the pipe (see identity_config), unless
+    // QEMU wouldn't take it that way.
+    if fds.config.is_none() {
+        let (hostfwd, guestfwd) = slirp_forwards(c);
+        let mut net = format!("user,id=net0,ipv6=off,hostfwd={hostfwd}");
+        if c.net != Net::Direct {
+            net.push_str(",restrict=on");
         }
+        if let Some(g) = guestfwd {
+            net.push_str(&format!(",guestfwd={g}"));
+        }
+        q.arg("-netdev").arg(net);
+        q.arg("-device").arg(format!("virtio-net-pci,netdev=net0,mac={},romfile=", c.mac));
     }
-    q.arg("-netdev").arg(net);
-    // romfile= : no network boot firmware, nothing to boot from there.
-    q.arg("-device").arg(format!("virtio-net-pci,netdev=net0,mac={},romfile=", c.mac));
 
     q.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-    let keep: Vec<RawFd> = [Some(fds.qmp), Some(fds.android), fds.media].into_iter().flatten().collect();
+    let keep: Vec<RawFd> = [Some(fds.qmp), Some(fds.android), fds.media, fds.config, Some(fds.smbios)].into_iter().flatten().collect();
     unsafe {
         q.pre_exec(move || {
             // Gone with PurrDroid, whatever happens to it.
@@ -174,7 +289,9 @@ pub struct Vm {
 /// straight away (QEMU waits for the disks before it carries on).
 pub fn start(c: &mut Config, serve: &mut dyn FnMut(UnixStream)) -> io::Result<Vm> {
     let mut last = String::new();
-    for attempt in 0..3 {
+    let mut by_pipe = true;
+    let mut attempt = 0;
+    while attempt < 3 {
         if attempt == 1 {
             if !c.sound {
                 c.gpu = false;
@@ -187,10 +304,18 @@ pub fn start(c: &mut Config, serve: &mut dyn FnMut(UnixStream)) -> io::Result<Vm
         let (qmp_ours, qmp_theirs) = UnixStream::pair()?;
         let (disk_ours, disk_theirs) = UnixStream::pair()?;
         let media = if c.install { Some(UnixStream::pair()?) } else { None };
-        let fds = Passed { qmp: qmp_theirs.as_raw_fd(), android: disk_theirs.as_raw_fd(), media: media.as_ref().map(|(_, t)| t.as_raw_fd()) };
+        let config = if by_pipe { Some(config_pipe(&identity_config(c)?)?) } else { None };
+        let smbios = memory_file(&smbios_table(&c.serial, &c.uuid)?)?;
+        let fds = Passed {
+            qmp: qmp_theirs.as_raw_fd(),
+            android: disk_theirs.as_raw_fd(),
+            media: media.as_ref().map(|(_, t)| t.as_raw_fd()),
+            config: config.as_ref().map(|f| f.as_raw_fd()),
+            smbios: smbios.as_raw_fd(),
+        };
         let spawned = command(c, &fds).spawn();
         // QEMU has its own copies now (or none, if it didn't start).
-        drop((qmp_theirs, disk_theirs));
+        drop((qmp_theirs, disk_theirs, config, smbios));
         let media = media.map(|(ours, _theirs)| ours);
         let mut child = spawned.map_err(|e| io::Error::other(format!("couldn't start qemu-system-x86_64 ({e}); is QEMU installed?")))?;
         serve(disk_ours);
@@ -212,6 +337,13 @@ pub fn start(c: &mut Config, serve: &mut dyn FnMut(UnixStream)) -> io::Result<Vm
                     if c.gpu && render_node().is_some() { "on" } else { "off" },
                     if sound { "on" } else { "off" }
                 );
+                // What it says from now on, passed on (never left to fill
+                // the pipe, which would stop QEMU).
+                if let Some(mut e) = child.stderr.take() {
+                    std::thread::spawn(move || {
+                        let _ = io::copy(&mut e, &mut io::stderr());
+                    });
+                }
                 return Ok(Vm { child, qmp: Qmp::new(qmp_ours)? });
             }
             Some(_) => {
@@ -221,6 +353,14 @@ pub fn start(c: &mut Config, serve: &mut dyn FnMut(UnixStream)) -> io::Result<Vm
                 }
                 last = err.trim().to_string();
                 eprintln!("purrdroid: QEMU quit at once: {last}");
+                // A QEMU that can't read its configuration from the pipe:
+                // on the command line instead (where /proc shows it).
+                if by_pipe && last.contains("/dev/fd/") {
+                    by_pipe = false;
+                    eprintln!("purrdroid: this QEMU won't read its settings from a pipe; giving them on its command line instead");
+                    continue;
+                }
+                attempt += 1;
             }
         }
     }
@@ -388,6 +528,49 @@ mod tests {
             }
         }
         (String::from_utf8_lossy(&buf[..n as usize]).into_owned(), fd)
+    }
+
+    #[test]
+    fn smbios_system_table() {
+        let t = smbios_table("0123ABCD", "00112233-4455-4677-8899-aabbccddeeff").unwrap();
+        assert_eq!(&t[..8], &[1, 27, 0, 1, 1, 2, 0, 3]);
+        assert_eq!(&t[8..24], &[0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x46, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(&t[27..], b"QEMU\0Standard PC (Q35 + ICH9, 2009)\00123ABCD\0\0");
+        assert!(smbios_table("x", "not a uuid").is_err());
+        let (_, _, uuid) = random_identity().unwrap();
+        assert!(smbios_table("x", &uuid).is_ok());
+    }
+
+    #[test]
+    fn identity_stays_off_the_command_line() {
+        let c = Config {
+            ram_mb: 2048,
+            cpus: 2,
+            width: 800,
+            height: 600,
+            gpu: false,
+            sound: false,
+            net: Net::Tor,
+            adb_port: 40000,
+            install: false,
+            disk_first: false,
+            mac: "02:aa:bb:cc:dd:ee".into(),
+            serial: "SERIAL1234".into(),
+            uuid: "00112233-4455-4677-8899-aabbccddeeff".into(),
+            exe: "/opt/pd/purrdroid".into(),
+            tor_socks: Some("/run/user/1000/purrdroid/tor/socks.sock".into()),
+        };
+        let fds = Passed { qmp: 10, android: 11, media: None, config: Some(12), smbios: 13 };
+        let q = command(&c, &fds);
+        let argv: Vec<String> = q.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let all = argv.join(" ");
+        for secret in ["SERIAL1234", "00112233", "02:aa:bb", "/run/user", "/opt/pd", "40000"] {
+            assert!(!all.contains(secret), "{secret} is on the command line: {all}");
+        }
+        assert!(all.contains("-readconfig /dev/fd/12") && all.contains("-smbios file=/dev/fd/13"));
+        let conf = identity_config(&c).unwrap();
+        assert!(conf.contains("mac = \"02:aa:bb:cc:dd:ee\"") && conf.contains("restrict = \"on\"") && conf.contains("relay /run/user/1000"));
+        assert!(conf.contains("hostfwd = \"tcp:127.0.0.1:40000-:5555\""));
     }
 
     #[test]

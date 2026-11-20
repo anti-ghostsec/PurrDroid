@@ -15,8 +15,10 @@
 //!       --no-window                        no window (Ctrl+C shuts Android down)
 //!   purrdroid send FILE... | --text TEXT | --url URL
 //!                                          send to the running Android
+//!                                          (--text - reads the text from stdin)
 //!   purrdroid apk FILE.apk...              install APKs on the running Android
-//!   purrdroid shell COMMAND                run a command in its shell (as adb shell)
+//!   purrdroid shell COMMAND | -            run a command in its shell (as adb
+//!                                          shell); - reads it from stdin
 //!   purrdroid passwd [--new-keyfile PATH]...
 //!                                          change the password and keyfiles
 //!   purrdroid duress [--duress-keyfile PATH]... | --off
@@ -1176,8 +1178,21 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
     Ok(())
 }
 
+/// Text given on the command line, which any program on this PC can read
+/// (in /proc) while PurrDroid runs: said once.
+fn warn_argv(what: &str) {
+    eprintln!("purrdroid: other programs on this PC can see {what} on a command line; `-` reads it from stdin instead");
+}
+
 fn cmd_shell(args: &[String]) -> Res<()> {
-    let command = args.join(" ");
+    let command = if args == ["-"] || (args.is_empty() && !interactive()) {
+        let mut s = String::new();
+        io::stdin().read_to_string(&mut s)?;
+        s
+    } else {
+        warn_argv("the command");
+        args.join(" ")
+    };
     if command.trim().is_empty() {
         return Err("which command? `purrdroid shell 'pm list packages'`".into());
     }
@@ -1440,6 +1455,7 @@ fn cmd_send(args: &[String]) -> Res<()> {
                     io::stdin().read_to_string(&mut s)?;
                     texts.push(s);
                 } else {
+                    warn_argv("the text");
                     texts.push(t.clone());
                 }
                 i += 1;
