@@ -376,9 +376,11 @@ is.
 - Someone who can write to the disk file can roll a block back to an older
   copy of itself; that's noticed only if it breaks the disk (as with LUKS).
   On an older plain disk (0.1.3 or before, not `--hidden`) the same goes for
-  a sector; such a disk that isn't filled shows which parts are used, and
-  two crashes in a row while one sector is being written can leave that
-  sector unreadable.
+  a sector; such a disk that isn't filled shows which parts are used (on
+  one that was filled, what Android discards is left as it is, or written
+  over with sealed zeros, so that stays hidden), and a power cut can leave
+  a sector written since Android last flushed unreadable rather than old
+  or new.
 - A hidden setup can only be made at `init`: one with a single Android
   can't have a second added later (PurrDroid can't know whether a slot or
   a disk is already taken without its password, and would overwrite it).

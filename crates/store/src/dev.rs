@@ -30,10 +30,15 @@ impl BlockDev for crate::Disk {
         crate::Disk::write_at(self, offset, data)
     }
     fn trim(&mut self, offset: u64, len: usize) -> io::Result<()> {
+        // A filled disk keeps what's there: a forgotten sector would show
+        // it's free (see disk.rs, "Discarding").
+        if self.is_filled() {
+            return Ok(());
+        }
         self.discard(offset, len)
     }
     fn write_zeroes(&mut self, offset: u64, len: usize) -> io::Result<()> {
-        // Discarded sectors read as zeros.
+        // Reads as zeros afterwards, filled or not.
         self.discard(offset, len)
     }
     fn flush(&mut self) -> io::Result<()> {

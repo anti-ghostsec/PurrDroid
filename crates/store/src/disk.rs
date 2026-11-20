@@ -31,6 +31,20 @@
 //! * A second crash in the same sector, while it's being written again right
 //!   after the first, can leave neither slot matching: that sector then
 //!   reads as an error, not as old or new data.
+//! * Nothing makes the seals reach the disk before the sector does: that
+//!   would take a sync between the two for every write, which would make
+//!   the disk many times slower. The file system usually writes them in
+//!   order, but after a power cut a sector written since Android's last
+//!   flush (which does sync) can read as an error instead of old or new.
+//!   What Android had flushed is safe.
+//!
+//! # Discarding
+//!
+//! On a disk with holes, a discarded sector's seals are zeroed, which reads
+//! as zeros and shows like a hole. On a filled disk (no holes, see above)
+//! that would show which parts are free again, so there a discard is
+//! ignored (Android only says it doesn't need those sectors) and a range
+//! that must read as zeros is written as sealed zeros, like any data.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -60,6 +74,18 @@ pub struct Disk {
     id: [u8; 16],
     sectors: u64,
     read_only: bool,
+    /// The file has no holes (made with `fill`): see "Discarding" above.
+    filled: bool,
+}
+
+/// True if the file has no holes up to the end of its last sector (the
+/// last group's unused room after it is never written).
+fn has_no_holes(file: &File, sectors: u64) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let end = data_offset(sectors - 1) + SECTOR as u64;
+    // SAFETY: lseek only moves this descriptor's offset.
+    let hole = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) };
+    hole >= 0 && hole as u64 >= end
 }
 
 fn random(buf: &mut [u8]) -> io::Result<()> {
@@ -136,7 +162,7 @@ impl Disk {
         random(&mut block)?;
         block[..sealed.len()].copy_from_slice(&sealed);
         file.write_all_at(&block, 0)?;
-        let mut disk = Disk { file, cipher: XChaCha20Poly1305::new(key.into()), id, sectors, read_only: false };
+        let mut disk = Disk { file, cipher: XChaCha20Poly1305::new(key.into()), id, sectors, read_only: false, filled: false };
         if fill {
             let zeros = vec![0u8; SECTOR * PER_GROUP as usize];
             let mut s = 0;
@@ -147,6 +173,7 @@ impl Disk {
             }
         }
         disk.file.sync_all()?;
+        disk.filled = fill;
         Ok(disk)
     }
 
@@ -162,7 +189,8 @@ impl Disk {
         if file.metadata()?.len() < file_len(sectors) {
             return Err(bad("the disk file has been cut short"));
         }
-        Ok(Disk { file, cipher: XChaCha20Poly1305::new(key.into()), id, sectors, read_only })
+        let filled = sectors > 0 && has_no_holes(&file, sectors);
+        Ok(Disk { file, cipher: XChaCha20Poly1305::new(key.into()), id, sectors, read_only, filled })
     }
 
     /// Size in bytes, as the virtual machine sees it.
@@ -176,6 +204,12 @@ impl Disk {
 
     pub fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// The disk was filled when it was made (it has no holes): see
+    /// "Discarding" above.
+    pub fn is_filled(&self) -> bool {
+        self.filled
     }
 
     fn aad(&self, sector: u64) -> [u8; 24] {
@@ -314,15 +348,20 @@ impl Disk {
         Ok(())
     }
 
-    /// Forgets the contents of the whole sectors in the range: they read as
-    /// zeros afterwards. Partial sectors at the ends are zeroed instead.
+    /// Makes the range read as zeros. On a disk with holes, the whole
+    /// sectors in it are forgotten (their seals zeroed); on a filled disk,
+    /// and for partial sectors at the ends, zeros are written and sealed
+    /// like any data, so nothing shows they're free (see "Discarding").
     pub fn discard(&mut self, offset: u64, len: usize) -> io::Result<()> {
         if self.read_only {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "this disk is read-only"));
         }
         self.check_range(offset, len)?;
+        let zeros = vec![0u8; SECTOR * PER_GROUP as usize];
         for (sector, within, n, _) in Self::runs(offset, len) {
-            if within == 0 && n % SECTOR == 0 {
+            if within == 0 && n % SECTOR == 0 && self.filled {
+                self.write_sectors(sector, &zeros[..n])?;
+            } else if within == 0 && n % SECTOR == 0 {
                 let count = n / SECTOR;
                 self.file.write_all_at(&vec![0u8; count * PAIR], meta_offset(sector))?;
             } else {
@@ -447,6 +486,24 @@ mod tests {
         d.read_at(0, &mut all).unwrap();
         assert_eq!(&all[..SECTOR], &pattern(SECTOR * 4, 9)[..SECTOR]);
         assert!(all[SECTOR..3 * SECTOR].iter().all(|&b| b == 0));
+        // Filled, so the discarded sectors' seals are new ones, not zeros.
+        assert!(d.is_filled());
+        let mut pair = vec![0u8; PAIR];
+        d.file.read_exact_at(&mut pair, meta_offset(1)).unwrap();
+        assert!(!is_empty(&pair[..SLOT]) && !is_empty(&pair[SLOT..]));
+        drop(d);
+        assert!(Disk::open(&p, &key, true).unwrap().is_filled());
         let _ = std::fs::remove_file(&p);
+
+        // Not filled: discarding forgets, as before.
+        let q = tmp("holes");
+        let mut d = Disk::create(&q, &key, 120, false).unwrap();
+        d.write_at(0, &pattern(SECTOR * 2, 3)).unwrap();
+        d.discard(0, SECTOR).unwrap();
+        d.file.read_exact_at(&mut pair, meta_offset(0)).unwrap();
+        assert!(is_empty(&pair));
+        drop(d);
+        assert!(!Disk::open(&q, &key, true).unwrap().is_filled());
+        let _ = std::fs::remove_file(&q);
     }
 }
