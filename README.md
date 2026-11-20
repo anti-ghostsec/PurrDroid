@@ -45,7 +45,7 @@ Only these files are ever written, all in `~/.local/share/purrdroid`:
 
 | File | What it is |
 |---|---|
-| `purrdroid.vault` | The keys and settings, sealed with your password and any keyfiles: Argon2id (192 MiB, 3 passes, about a second a guess), then XChaCha20-Poly1305. Four slots, one per Android; slots not in use are random bytes. |
+| `purrdroid.vault` | The keys and settings, sealed with your password and any keyfiles: Argon2id (192 MiB, 3 passes, about a second a guess), then XChaCha20-Poly1305. Four slots, one per Android; slots not in use are random bytes. Always the same size, and rewritten in place (never replaced by a new file, which would leave the old one, openable with an old password, in the disk's free space), only when something in it changed. |
 | `android.disk` | Android's disk: a [deniable](https://github.com/anti-ghostsec/deniable) container, filled with random bytes when it's made (32 GiB unless `init --size` says otherwise), holding one Android's disk, or two for a [hidden Android](#hidden-android). Blocks are sealed with XChaCha20-Poly1305 under a random 256-bit key and bound to their place, so they can't be changed or moved unnoticed. |
 | `media.disk` | The imported ISO, every 4 KiB sector sealed on its own with XChaCha20-Poly1305 under a random 256-bit key, its number and the disk's id bound in. It's there only until Android is installed: the first time Android starts from its own disk, it's written over and removed. |
 
@@ -157,7 +157,9 @@ rest even if it's cut short, then every disk (only the parts that hold
 anything, so a big sparse disk is quick), syncs them and removes them. On an
 SSD the drive may keep old copies of overwritten blocks where no program can
 reach them; there the vault is what matters: the disks' keys exist only in
-it, and an old copy of it still needs the password and keyfiles.
+it, and an old copy of it still needs the password and keyfiles. (The same
+goes for a filesystem that never overwrites in place, such as btrfs or ZFS:
+an old copy of the vault there opens with the password it had then.)
 
 ### Next to VeraCrypt
 
@@ -384,7 +386,9 @@ is.
   of its four slots changed in between: the slots whose Android was
   started. With a hidden Android, someone who has copies from before and
   after you used the real one sees a slot change that the decoy's password
-  doesn't open. The container's cover writes blur the same
+  doesn't open. The vault is written only when something in the slot
+  changed, which keeps this to sessions that changed a setting. The
+  container's cover writes blur the same
   comparison for the disk, as far as the decoy's own use can explain it.
 - A PurrDroid set up with 0.1.3 or before without `--hidden` keeps its older
   plain disk (see [Upgrading](#encryption)): its vault and disk look unlike

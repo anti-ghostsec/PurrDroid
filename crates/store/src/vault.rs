@@ -17,6 +17,20 @@
 //! so slots can't be swapped around or the salt changed without that
 //! failing like a wrong password.
 //!
+//! # Saving
+//!
+//! The vault is always the same size, so it's rewritten in place, never
+//! replaced by a new file: a new file would leave the old one's blocks
+//! behind, free but readable, and an old copy opens with an old password
+//! (one changed away from, or after the duress password was used). To
+//! survive a crash part-way, the new contents go first to a file beside it
+//! (`purrdroid.vault.new`), synced; then the vault is overwritten and
+//! synced; then that file is written over with random bytes, synced and
+//! removed. If PurrDroid finds it at the next unlock it finishes the job
+//! (or drops it, if the vault was already written). Nothing is written when
+//! nothing changed. On a copy-on-write filesystem (btrfs, ZFS) or an SSD,
+//! overwriting may still leave old copies where no program can reach them.
+//!
 //! # Duress password
 //!
 //! A password (with keyfiles or not) that, given instead of a real one,
@@ -29,7 +43,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -189,6 +203,8 @@ pub struct Vault {
     slot: usize,
     key: Zeroizing<[u8; 32]>,
     pub settings: Settings,
+    /// The settings as last saved (or read), to save only when they change.
+    saved: Zeroizing<Vec<u8>>,
 }
 
 fn duress_check(key: &[u8; 32]) -> [u8; CHECK] {
@@ -224,8 +240,8 @@ fn try_open(bytes: &[u8], salt: &[u8], key: &[u8; 32], slot: usize) -> Option<Ze
 }
 
 /// Overwrites the file with random bytes, flushes it and removes it.
-fn destroy_file(path: &Path) {
-    if let Ok(f) = fs::OpenOptions::new().write(true).open(path) {
+fn scrub_file(path: &Path) {
+    if let Ok(f) = fs::OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(path) {
         let len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
         let mut junk = vec![0u8; len.max(FILE_LEN)];
         let _ = vaultkit::random_bytes(&mut junk);
@@ -233,6 +249,54 @@ fn destroy_file(path: &Path) {
         let _ = f.sync_all();
     }
     let _ = fs::remove_file(path);
+}
+
+/// The vault, and the new contents waiting beside it while it's being
+/// rewritten (see "Saving" above), both written over and removed.
+fn destroy_file(path: &Path) {
+    scrub_file(path);
+    scrub_file(&pending_path(path));
+}
+
+/// Where the new contents wait while the vault is rewritten.
+fn pending_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".new");
+    path.with_file_name(name)
+}
+
+fn sync_dir(path: &Path) -> io::Result<()> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Writes `bytes` over the start of the file at `path` and syncs it,
+/// making it (owner only) if `create`; never through a link.
+fn write_synced(path: &Path, bytes: &[u8], create: bool) -> io::Result<()> {
+    let mut o = fs::OpenOptions::new();
+    o.write(true).custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    if create {
+        o.create(true);
+    }
+    let f = o.open(path)?;
+    if f.metadata()?.len() > bytes.len() as u64 {
+        f.set_len(bytes.len() as u64)?;
+    }
+    f.write_all_at(bytes, 0)?;
+    f.sync_all()
+}
+
+/// Saves the whole vault in place, crash-safe (see "Saving" above).
+fn write_vault(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let pending = pending_path(path);
+    write_synced(&pending, bytes, true)?;
+    sync_dir(path)?;
+    write_synced(path, bytes, false)?;
+    scrub_file(&pending);
+    sync_dir(path)
 }
 
 fn constant_eq(a: &[u8], b: &[u8]) -> bool {
@@ -261,9 +325,20 @@ impl Vault {
         let key = derive(password, keyfiles, &salt)?;
         let mut r = [0u8; 1];
         vaultkit::random_bytes(&mut r)?;
-        let v = Vault { path: path.to_path_buf(), salt, slot: r[0] as usize % SLOTS, key, settings: Settings::default() };
+        let mut v = Vault {
+            path: path.to_path_buf(),
+            salt,
+            slot: r[0] as usize % SLOTS,
+            key,
+            settings: Settings::default(),
+            saved: Zeroizing::new(Vec::new()),
+        };
         v.write_slot(&mut bytes)?;
-        vaultkit::write_private_atomic(path, &bytes)?;
+        // A new file, never one that's there (or a link).
+        fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+        write_synced(path, &bytes, false)?;
+        sync_dir(path)?;
+        v.saved = v.settings.serialize()?;
         Ok(v)
     }
 
@@ -272,18 +347,45 @@ impl Vault {
     /// any wrong one.
     pub fn unlock(path: &Path, password: &[u8], keyfiles: Option<&Secret>) -> Result<Vault> {
         let bytes = read_file(path)?;
+        let pending = pending_path(path);
         let salt: [u8; SALT] = bytes[..SALT].try_into().unwrap();
         let key = derive(password, keyfiles, &salt)?;
-        for slot in 0..SLOTS {
-            if let Some(plain) = try_open(&bytes, &salt, &key, slot) {
-                let settings = Settings::parse(&plain)?;
-                return Ok(Vault { path: path.to_path_buf(), salt, slot, key, settings });
+        if let Some(v) = Self::open_slot(path, &bytes, key.clone())? {
+            // A save that was cut short after the vault was written: what
+            // waited beside it isn't needed.
+            if pending.exists() {
+                scrub_file(&pending);
             }
+            return Ok(v);
         }
         if constant_eq(&duress_check(&key), &bytes[SALT..HEAD]) {
             destroy_file(path);
+            return Err(Error::WrongPassword);
+        }
+        // A save cut short while the vault itself was being written (or
+        // before): the new contents are beside it, whole. Finished now.
+        if let Ok(new) = read_file(&pending) {
+            let new_salt: [u8; SALT] = new[..SALT].try_into().unwrap();
+            let key = if new_salt == salt { key } else { derive(password, keyfiles, &new_salt)? };
+            if let Some(v) = Self::open_slot(path, &new, key)? {
+                write_vault(path, &new)?;
+                return Ok(v);
+            }
         }
         Err(Error::WrongPassword)
+    }
+
+    /// The slot of `bytes` that `key` opens, if any.
+    fn open_slot(path: &Path, bytes: &[u8], key: Zeroizing<[u8; 32]>) -> Result<Option<Vault>> {
+        let salt: [u8; SALT] = bytes[..SALT].try_into().unwrap();
+        for slot in 0..SLOTS {
+            if let Some(plain) = try_open(bytes, &salt, &key, slot) {
+                let settings = Settings::parse(&plain)?;
+                let saved = settings.serialize()?;
+                return Ok(Some(Vault { path: path.to_path_buf(), salt, slot, key, settings, saved }));
+            }
+        }
+        Ok(None)
     }
 
     pub fn path(&self) -> &Path {
@@ -297,11 +399,20 @@ impl Vault {
     }
 
     /// Seals the settings back into this slot, leaving the other slots as
-    /// they are (atomically: a crash leaves the old vault or the new one).
-    pub fn save(&self) -> Result<()> {
+    /// they are (a crash leaves the old vault or the new one), if they've
+    /// changed since they were read or last saved.
+    pub fn save(&mut self) -> Result<()> {
+        if self.settings.serialize()?[..] == self.saved[..] {
+            return Ok(());
+        }
+        self.save_now()
+    }
+
+    fn save_now(&mut self) -> Result<()> {
         let mut bytes = read_file(&self.path)?;
         self.write_slot(&mut bytes)?;
-        vaultkit::write_private_atomic(&self.path, &bytes)?;
+        write_vault(&self.path, &bytes)?;
+        self.saved = self.settings.serialize()?;
         Ok(())
     }
 
@@ -319,7 +430,7 @@ impl Vault {
             return Err(Error::SamePassword);
         }
         self.key = key;
-        self.save()
+        self.save_now()
     }
 
     /// Fills another slot, for a second Android opened by another password
@@ -335,9 +446,10 @@ impl Vault {
         vaultkit::random_bytes(&mut r)?;
         let free: Vec<usize> = (0..SLOTS).filter(|&s| s != self.slot).collect();
         let slot = free[r[0] as usize % free.len()];
-        let v = Vault { path: self.path.clone(), salt: self.salt, slot, key, settings: Settings::default() };
+        let mut v = Vault { path: self.path.clone(), salt: self.salt, slot, key, settings: Settings::default(), saved: Zeroizing::new(Vec::new()) };
         v.write_slot(&mut bytes)?;
-        vaultkit::write_private_atomic(&self.path, &bytes)?;
+        write_vault(&self.path, &bytes)?;
+        v.saved = v.settings.serialize()?;
         Ok(v)
     }
 
@@ -361,7 +473,8 @@ impl Vault {
         };
         bytes[SALT..HEAD].copy_from_slice(&check);
         self.write_slot(&mut bytes)?;
-        vaultkit::write_private_atomic(&self.path, &bytes)?;
+        write_vault(&self.path, &bytes)?;
+        self.saved = self.settings.serialize()?;
         Ok(())
     }
 
@@ -409,6 +522,49 @@ mod tests {
 
         assert!(matches!(Vault::unlock(&p, b"panic", None), Err(Error::WrongPassword)));
         assert!(!p.exists(), "duress destroyed the vault");
+    }
+
+    #[test]
+    fn saved_in_place_and_only_when_changed() {
+        use std::os::unix::fs::MetadataExt;
+        let p = tmp("inplace");
+        let mut v = Vault::create(&p, b"pw", None).unwrap();
+        let ino = fs::metadata(&p).unwrap().ino();
+        v.settings.set("a", "1");
+        v.save().unwrap();
+        assert_eq!(fs::metadata(&p).unwrap().ino(), ino, "the same file, rewritten");
+        let before = fs::read(&p).unwrap();
+        v.save().unwrap();
+        assert_eq!(fs::read(&p).unwrap(), before, "nothing changed, nothing written");
+        v.set_password(b"pw2", None).unwrap();
+        assert_ne!(fs::read(&p).unwrap(), before, "a new password is written even with the same settings");
+        assert_eq!(fs::metadata(&p).unwrap().ino(), ino);
+        assert!(!pending_path(&p).exists());
+        drop(v);
+
+        // Cut short with the new contents beside it and the vault not yet
+        // written (or half written): the new password opens it, and the
+        // save is finished.
+        let mut v = Vault::unlock(&p, b"pw2", None).unwrap();
+        let old = fs::read(&p).unwrap();
+        v.settings.set("b", "2");
+        v.save().unwrap();
+        let new = fs::read(&p).unwrap();
+        fs::write(pending_path(&p), &new).unwrap();
+        let mut torn = old.clone();
+        torn[HEAD..HEAD + FILE_LEN / 2].copy_from_slice(&new[HEAD..HEAD + FILE_LEN / 2]);
+        let f = fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.write_all_at(&torn, 0).unwrap();
+        drop(f);
+        let v = Vault::unlock(&p, b"pw2", None).unwrap();
+        assert_eq!(v.settings.get("b"), Some("2"));
+        assert_eq!(fs::read(&p).unwrap(), new);
+        assert!(!pending_path(&p).exists(), "finished and wiped");
+        // And when the vault was written already, what's beside it is dropped.
+        fs::write(pending_path(&p), &old).unwrap();
+        assert_eq!(Vault::unlock(&p, b"pw2", None).unwrap().settings.get("b"), Some("2"));
+        assert!(!pending_path(&p).exists());
+        let _ = fs::remove_file(&p);
     }
 
     #[test]
