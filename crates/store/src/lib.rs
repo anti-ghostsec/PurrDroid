@@ -4,12 +4,14 @@
 //!   (Argon2id, then XChaCha20-Poly1305). It holds the random keys of the
 //!   disks, the key Android's debugging bridge knows PurrDroid by, and the
 //!   settings, in one of four slots (one per Android: see [`hidden`]).
-//! * [`disk`]: the virtual disks Android runs on (and the imported ISO),
-//!   every 4 KiB sector sealed on its own with XChaCha20-Poly1305 under a
-//!   random 256-bit key that only the vault holds.
-//! * [`hidden`]: instead of a plain disk, a container from the `deniable`
-//!   crate holding a decoy Android's disk and, hidden above it, the real
-//!   one's.
+//! * [`hidden`]: Android's disk, in a container from the `deniable` crate,
+//!   random bytes all through, holding one Android's disk or (a hidden
+//!   Android) a decoy's and, hidden above it, the real one's. Every new
+//!   PurrDroid gets one, so the two can't be told apart.
+//! * [`disk`]: the imported ISO and the emulator engine's state (and, from
+//!   PurrDroid 0.1.3 and before, Android's own disk), every 4 KiB sector
+//!   sealed on its own with XChaCha20-Poly1305 under a random 256-bit key
+//!   that only the vault holds.
 //!
 //! None of them has a magic number, a version or anything else in the clear:
 //! without the password the vault is random bytes, and without the vault a

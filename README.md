@@ -28,7 +28,9 @@ memory. Written in Rust.
 - **Android** is a normal Android-x86 build: [BlissOS](https://blissos.org)
   is the one to use (it comes with Google Play, or with microG instead).
   Its ISO is imported into PurrDroid's encrypted storage and installed from
-  there, so not even the installer stays on the disk in the clear.
+  there, and wiped once Android starts from its own disk. The ISO you
+  downloaded stays where it was unless you have PurrDroid overwrite it
+  (`import --remove`).
 - **A virtual machine, not a container**, so Android's apps run against
   their own kernel and can't reach FerroOS's. QEMU itself runs with its
   seccomp sandbox on, gets no files and no keys, and dies with PurrDroid.
@@ -40,12 +42,21 @@ Only these files are ever written, all in `~/.local/share/purrdroid`:
 | File | What it is |
 |---|---|
 | `purrdroid.vault` | The keys and settings, sealed with your password and any keyfiles: Argon2id (192 MiB, 3 passes, about a second a guess), then XChaCha20-Poly1305. Four slots, one per Android; slots not in use are random bytes. |
-| `android.disk` | Android's disk. Every 4 KiB sector is sealed on its own with XChaCha20-Poly1305 under a random 256-bit key, its number and the disk's id bound in, so sectors can't be changed, swapped or moved between disks unnoticed. In hidden mode, a [deniable](https://github.com/anti-ghostsec/deniable) container instead (below). |
-| `media.disk` | The imported ISO, sealed the same way. |
+| `android.disk` | Android's disk: a [deniable](https://github.com/anti-ghostsec/deniable) container, filled with random bytes when it's made (32 GiB unless `init --size` says otherwise), holding one Android's disk, or two for a [hidden Android](#hidden-android). Blocks are sealed with XChaCha20-Poly1305 under a random 256-bit key and bound to their place, so they can't be changed or moved unnoticed. |
+| `media.disk` | The imported ISO, every 4 KiB sector sealed on its own with XChaCha20-Poly1305 under a random 256-bit key, its number and the disk's id bound in. It's there only until Android is installed: the first time Android starts from its own disk, it's written over and removed. |
 
 None of them has a magic number or anything else in the clear: without the
-password, they're random bytes (and, for a plain disk not yet filled, holes
-of zeros; `init --fill` writes it all once).
+password, they're random bytes.
+
+**Upgrading from 0.1.3 or before:** a PurrDroid set up then keeps working as
+it is. Its `android.disk`, unless it was made with `--hidden`, is the older
+kind: every 4 KiB sector sealed on its own, sparse (it shows how much of it
+has been used) unless it was made with `--fill`. It isn't converted (that
+would need room for a second copy); to move to a container, copy what you
+want out of Android, `purrdroid destroy`, and set it up again. A hidden setup
+from then is already a container; its vault slots are relabelled at the next
+start so a decoy's reads like any other's, but it was made at 64 GiB, where a
+setup without a hidden Android was 32.
 
 **Against quantum computers:** there's no public-key cryptography here,
 which is what a quantum computer breaks. A 256-bit symmetric key keeps 128
@@ -79,27 +90,38 @@ it from the File Manager. `purrdroid passwd --new-keyfile PATH` changes them;
 ### Hidden Android
 
 ```sh
-purrdroid init --hidden --size 64 [--decoy-keyfile PATH] [--keyfile PATH]
+purrdroid init --hidden [--decoy-keyfile PATH] [--keyfile PATH]
 ```
 
 Two Androids in one container from the `deniable` crate (the storage Enclave
-hides its vaults in): a decoy, and above it the real one. The decoy password
-opens an ordinary-looking PurrDroid with one Android in it; nothing in the
-vault or the container shows there's another slot or another disk, how many
-there are, or where. Each has its own adb key, serial number and network
-address. Install each as usual, once with each password (`import` the ISO
-again with the second password first).
+hides its vaults in): a decoy, and above it the real one. Every PurrDroid's
+disk is such a container, the same size (unless `--size` is given), filled
+with random bytes the same way, and every vault slot says the same about
+its disk, so the decoy password opens what looks exactly like a PurrDroid
+with one Android in it: nothing in the vault or the container shows there's
+another slot or another disk, how many there are, or where. Each has its own
+adb key, serial number and network address. Install each as usual, once with
+each password, one after the other: `import` the ISO, `install`, and start
+it once from its own disk (which wipes the ISO), then the same with the
+other password. An ISO imported with one password is as good as none to the
+other: it's told there's no complete ISO, as after an import that was cut
+short.
+
+Keep to the default size: a container much bigger than usual is a hint that
+it holds more than one Android.
 
 - **Use the real one day to day.** Opening the real one opens the decoy's
   disk too, so its writes go around the decoy's. With only the decoy open,
   its writes can land on the real one's data, which it knows nothing about.
-- Both Androids see the same size of disk and share the room; together they
-  can't hold more than the container.
-- `deniable` writes a disk's whole block map at each save, so in hidden mode
-  PurrDroid saves every 5 seconds (and when Android stops) instead of
-  whenever Android asks. Each save is all-or-nothing: after a power cut the
-  disk is as it was at the last save, whole, and the last few seconds are
-  lost. It's also slower than a plain disk, and wears an SSD more.
+- Both Androids see the same size of disk (90% of the container) and share
+  the room; together they can't hold more than the container.
+- `deniable` writes a disk's whole block map at each save (about 1 MiB for
+  every GiB of disk), so PurrDroid saves every 5 seconds while Android
+  writes (and when Android stops) instead of whenever Android asks. Each
+  save is all-or-nothing: after a power cut the disk is as it was at the
+  last save, whole, and the last few seconds are lost. It's slower than a
+  plain encrypted file, and wears an SSD more. This is the same for every
+  PurrDroid, hidden Android or not: that's what keeps them alike.
 
 **Duress password:** `purrdroid duress` sets a password (with keyfiles or
 not, `--duress-keyfile`) that, given instead of a real one, destroys the
@@ -299,12 +321,24 @@ UUID and network address are random, made once per vault.
   Google sees a virtual machine, as with any emulator.
 - ARM-only apps need the ARM translation BlissOS can turn on in its
   settings, and run slower.
-- Rolling one sector of a plain disk back to an older copy of itself isn't
-  detected (as with LUKS), and a plain disk that isn't filled shows which
-  parts are used. Two crashes in a row while one sector is being written
-  can leave that sector unreadable.
-- A hidden setup can only be made at `init`: a plain one can't be turned
-  into one later.
+- Someone who can write to the disk file can roll a block back to an older
+  copy of itself; that's noticed only if it breaks the disk (as with LUKS).
+  On an older plain disk (0.1.3 or before, not `--hidden`) the same goes for
+  a sector; such a disk that isn't filled shows which parts are used, and
+  two crashes in a row while one sector is being written can leave that
+  sector unreadable.
+- A hidden setup can only be made at `init`: one with a single Android
+  can't have a second added later (PurrDroid can't know whether a slot or
+  a disk is already taken without its password, and would overwrite it).
+- Comparing two copies of the vault taken at different times shows which
+  of its four slots changed in between: the slots whose Android was
+  started. With a hidden Android, someone who has copies from before and
+  after you used the real one sees a slot change that the decoy's password
+  doesn't open. The container's cover writes blur the same
+  comparison for the disk, as far as the decoy's own use can explain it.
+- A PurrDroid set up with 0.1.3 or before without `--hidden` keeps its older
+  plain disk (see [Upgrading](#encryption)): its vault and disk look unlike
+  a hidden setup's.
 - The window has no shared clipboard and can't change Android's screen
   size when resized (it scales instead).
 - The adb port is on 127.0.0.1: other programs on this PC can reach it, but

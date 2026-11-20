@@ -15,7 +15,7 @@ fn main() {
         use purrdroid_store::hidden;
         if !path.exists() {
             let bytes = sectors * 4096;
-            hidden::create(path, bytes, &[0x41u8; 32], &key, hidden::disk_len_for(bytes)).unwrap();
+            hidden::create(path, bytes, &[&[0x41u8; 32], &key], hidden::disk_len_for(bytes), &mut |_, _| {}).unwrap();
         }
         let (c, id) = hidden::open(path, &key).unwrap();
         let saver = c.clone();

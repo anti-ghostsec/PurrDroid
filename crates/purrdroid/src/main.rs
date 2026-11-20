@@ -1,6 +1,7 @@
 //! PurrDroid: Android apps on FerroOS, in a virtual machine.
 //!
-//!   purrdroid init [--size GiB] [--fill]   make the vault and Android's disk
+//!   purrdroid init [--size GiB]            make the vault and Android's disk
+//!                                          (32 GiB, filled with random bytes)
 //!   purrdroid init --hidden [--size GiB]   the same, with a decoy Android and,
 //!                                          hidden behind it, the real one
 //!   purrdroid init --emulator [--sdk PATH] [--image system-images/...]
@@ -236,12 +237,15 @@ fn cmd_init(args: &[String]) -> Res<()> {
         return Err(format!("there's already a PurrDroid in {} (see `purrdroid destroy`)", f.vault.parent().unwrap().display()).into());
     }
     let hidden_mode = args.iter().any(|a| a == "--hidden");
-    let gib: u64 =
-        flag_value(args, "--size").map(|s| s.trim_end_matches(['G', 'g']).parse()).transpose()?.unwrap_or(if hidden_mode { 64 } else { 32 });
+    // The same size whether there's a hidden Android or not: a size only
+    // hidden setups use would give them away.
+    let gib: u64 = flag_value(args, "--size").map(|s| s.trim_end_matches(['G', 'g']).parse()).transpose()?.unwrap_or(DEFAULT_GIB);
     if !(8..=1024).contains(&gib) {
         return Err("--size is in GiB, from 8 to 1024".into());
     }
-    let fill = args.iter().any(|a| a == "--fill");
+    if args.iter().any(|a| a == "--fill") {
+        println!("(--fill isn't needed any more: every new disk is filled with random bytes.)");
+    }
     println!("PurrDroid keeps Android's disk encrypted with a password and any keyfiles");
     println!("(Argon2id, XChaCha20-Poly1305). There's no way back in without them:");
     println!("write the password down somewhere safe, and keep copies of keyfiles.");
@@ -270,18 +274,17 @@ fn cmd_init(args: &[String]) -> Res<()> {
         return Ok(());
     }
 
+    let bytes = gib << 30;
     if !hidden_mode {
         let (pw, secret) = ask_new("password", flag_paths(args, "--keyfile"))?;
         let mut v = Vault::create(&f.vault, pw.as_bytes(), secret.as_ref())?;
         let key = v.settings.new_key("android_key")?;
-        v.settings.set("disk", "plain");
+        v.settings.set("disk", "container");
         new_android(&mut v)?;
-        v.save()?;
-        let sectors = gib * (1 << 30) / purrdroid_store::disk::SECTOR as u64;
-        if fill {
-            println!("Writing all {gib} GiB once, so the disk has no holes...");
+        if let Err(e) = v.save().map_err(Into::into).and_then(|()| make_container_shown(&f.android, bytes, &[&key])) {
+            v.destroy();
+            return Err(e);
         }
-        prepare_disk(&mut Disk::create(&f.android, &key, sectors, fill)?)?;
         println!("Made a {gib} GiB disk for Android ({}).", f.android.display());
         println!("Next: `purrdroid import android.iso`, then `purrdroid install`.");
         return Ok(());
@@ -303,20 +306,61 @@ fn cmd_init(args: &[String]) -> Res<()> {
             return Err(e.into());
         }
     };
-    let bytes = gib << 30;
-    let disk_len = hidden::disk_len_for(bytes);
+    // Each slot exactly as a PurrDroid with one Android has it.
     for v in [&mut decoy, &mut real] {
         v.settings.new_key("android_key")?;
-        v.settings.set("disk", "hidden");
+        v.settings.set("disk", "container");
         new_android(v)?;
     }
-    println!("Filling {gib} GiB with random bytes (this takes a few minutes)...");
-    hidden::create(&f.android, bytes, &decoy.settings.key("android_key").unwrap(), &real.settings.key("android_key").unwrap(), disk_len)?;
-    decoy.save()?;
-    real.save()?;
-    println!("Made the container ({}): each Android sees a {} GiB disk, and they share", f.android.display(), disk_len >> 30);
+    let made = decoy.save().and_then(|()| real.save()).map_err(Into::into).and_then(|()| {
+        make_container_shown(&f.android, bytes, &[&decoy.settings.key("android_key").unwrap(), &real.settings.key("android_key").unwrap()])
+    });
+    if let Err(e) = made {
+        drop(real);
+        decoy.destroy();
+        return Err(e);
+    }
+    println!("Made the container ({}): each Android sees a {} GiB disk, and they share", f.android.display(), hidden::disk_len_for(bytes) >> 30);
     println!("the room. Install each one: `purrdroid import android.iso` and");
     println!("`purrdroid install`, once with the decoy password and once with the real one.");
+    Ok(())
+}
+
+/// Android's disk size for a new PurrDroid, in GiB, hidden Android or not.
+const DEFAULT_GIB: u64 = 32;
+
+/// Makes Android's container: random bytes all through, a disk in it for
+/// each key (each above the one before), each made ready for an ISO's
+/// installer.
+fn make_container(path: &Path, bytes: u64, keys: &[&[u8; 32]], progress: &mut dyn FnMut(u64, u64)) -> Res<()> {
+    hidden::create(path, bytes, keys, hidden::disk_len_for(bytes), progress)?;
+    let prepared = (|| -> Res<()> {
+        let (c, _) = hidden::open(path, keys.last().ok_or("no key")?)?;
+        for id in hidden::volumes(&c) {
+            prepare_disk(&mut hidden::Volume::new(c.clone(), id)?)?;
+        }
+        hidden::save(&c)?;
+        Ok(())
+    })();
+    if prepared.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    prepared
+}
+
+/// [`make_container`], saying how far it's got on the terminal.
+fn make_container_shown(path: &Path, bytes: u64, keys: &[&[u8; 32]]) -> Res<()> {
+    println!("Filling {} GiB with random bytes, once (this takes a few minutes)...", bytes >> 30);
+    let mut shown = u64::MAX;
+    make_container(path, bytes, keys, &mut |d, t| {
+        let pc = if t == 0 { 100 } else { d * 100 / t };
+        if pc != shown {
+            shown = pc;
+            print!("\r{pc}%   ");
+            let _ = io::stdout().flush();
+        }
+    })?;
+    println!();
     Ok(())
 }
 
@@ -399,6 +443,13 @@ fn import_iso(v: &mut Vault, iso: &Path, progress: &std::sync::atomic::AtomicU64
     v.settings.set("media_len", &len.to_string());
     v.save()?;
     Ok(())
+}
+
+/// The ISO this slot imported, if it's there, whole, and opens with this
+/// slot's key. (Anything else is as good as no ISO: an import cut short, say.)
+fn media_disk(v: &Vault, f: &paths::Files) -> Option<Disk> {
+    let key = v.settings.key("media_key")?;
+    Disk::open(&f.media, &key, true).ok()
 }
 
 /// Overwrites a file with random bytes, then removes it. (On an SSD the
@@ -498,7 +549,15 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
     let android_key = v.settings.key("android_key").ok_or("the vault has no key for Android's disk")?;
     let mut exports: HashMap<String, purrdroid_nbd::Export> = HashMap::new();
     let mut container = None;
+    // "hidden" was 0.1.3's name for it, in hidden setups only: renamed, so
+    // a decoy's slot reads like any other.
     if v.settings.get("disk") == Some("hidden") {
+        v.settings.set("disk", "container");
+        v.save()?;
+    }
+    // A vault from 0.1.3 or before with no hidden Android has a plain
+    // encrypted disk ("plain", or nothing said): still opened as it is.
+    if v.settings.get("disk") == Some("container") {
         let (c, id) = hidden::open(&files.android, &android_key)?;
         exports.insert("android".to_string(), Arc::new(Mutex::new(hidden::Volume::new(c.clone(), id)?)));
         // Saved every few seconds, and at the end (see hidden.rs).
@@ -524,7 +583,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
     // it hands over to the ISO, and once a boot loader is on it the
     // installer's own Reboot starts the installed Android.
     let mut disk_first = readable && first[..440] == blank_boot_code();
-    if !install && v.settings.get("media_key").is_some() && files.media.exists() {
+    if !install && media_disk(v, &files).is_some() {
         if readable && first[510..512] == [0x55, 0xAA] && (first[..440].iter().all(|&b| b == 0) || first[..440] == blank_boot_code()) {
             // On a GPT disk the installer can't put its boot loader (it asks
             // to convert, and its default is No): made MBR here first, the
@@ -547,15 +606,32 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         }
     }
     if install {
-        let key = v.settings.key("media_key").ok_or("no ISO for this password yet: `purrdroid import FILE.iso` first")?;
-        let media =
-            Disk::open(&files.media, &key, true).map_err(|_| "the ISO was imported with the other password: import it again with this one")?;
+        let Some(media) = media_disk(v, &files) else {
+            if v.settings.get("media_key").is_some() {
+                v.settings.remove("media_key");
+                v.settings.remove("media_len");
+                v.save()?;
+            }
+            return Err("there's no complete ISO here to install from: `purrdroid import FILE.iso` first".into());
+        };
         exports.insert("media".to_string(), Arc::new(Mutex::new(media)));
         // An installer has run on this disk: from now on it may hold Android.
         if v.settings.get("install_ran") != Some("yes") {
             v.settings.set("install_ran", "yes");
             v.save()?;
         }
+    }
+    // Android starts from its own disk now: the ISO it was installed from
+    // isn't needed, and isn't left for another password's Android to find.
+    let boots_itself = readable && first[510..512] == [0x55, 0xAA] && first[..440].iter().any(|&b| b != 0) && first[..440] != blank_boot_code();
+    if !install && boots_itself && v.settings.get("media_key").is_some() {
+        if media_disk(v, &files).is_some() {
+            purrdroid_store::wipe::wipe_file(&files.media, &mut |_, _| {})?;
+            eprintln!("purrdroid: Android starts from its own disk now, so the imported ISO was wiped (import one again to reinstall).");
+        }
+        v.settings.remove("media_key");
+        v.settings.remove("media_len");
+        v.save()?;
     }
     drop(android_key);
     let socks = vm::sockets(&rt);
@@ -1201,8 +1277,18 @@ fn gui_main() -> Res<()> {
             }
             panel::Engine::Iso => {
                 let key = v.settings.new_key("android_key")?;
-                v.settings.set("disk", "plain");
-                prepare_disk(&mut Disk::create(&f.android, &key, 32 * (1 << 30) / purrdroid_store::disk::SECTOR as u64, false)?)?;
+                v.settings.set("disk", "container");
+                v.save()?;
+                let made = gui::working(
+                    "PurrDroid",
+                    &format!("Filling Android's {DEFAULT_GIB} GiB disk with random bytes, once..."),
+                    |p| make_container(&f.android, DEFAULT_GIB << 30, &[&key], p).map_err(|e| e.to_string()),
+                )
+                .and_then(|r| r.map_err(Into::into));
+                if let Err(e) = made {
+                    v.destroy();
+                    return Err(e);
+                }
             }
         }
         v.save()?;
@@ -1214,7 +1300,7 @@ fn gui_main() -> Res<()> {
     let could_be_installed = |v: &Vault| v.settings.get("install_ran") == Some("yes");
     if v.settings.get("engine") != Some("emulator") && (v.settings.get("android_ready") != Some("yes") || !could_be_installed(&v)) {
         loop {
-            let has_iso = v.settings.get("media_key").is_some() && f.media.exists();
+            let has_iso = media_disk(&v, &f).is_some();
             let installed = could_be_installed(&v);
             let mut import = |iso: &Path, progress: &std::sync::atomic::AtomicU64| -> Res<()> {
                 import_iso(&mut v, iso, progress).map_err(|e| e.to_string().into())
@@ -1315,7 +1401,7 @@ fn gpt_to_mbr(d: &mut dyn purrdroid_store::dev::BlockDev) -> Res<bool> {
 /// partition table with one bootable Linux partition over all of it. The
 /// installer then offers vda1 straight away, and never a GPT disk, on
 /// which it can't put its boot loader.
-fn prepare_disk(d: &mut Disk) -> Res<()> {
+fn prepare_disk(d: &mut dyn purrdroid_store::dev::BlockDev) -> Res<()> {
     let sectors = (d.len() / 512).min(u64::from(u32::MAX));
     let mut mbr = [0u8; 512];
     mbr[..440].copy_from_slice(&blank_boot_code());
