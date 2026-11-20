@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "purrdroid"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "purrdroid-adb",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "purrdroid-adb"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "rand_core",
@@ -393,18 +393,18 @@ dependencies = [
 
 [[package]]
 name = "purrdroid-nbd"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "purrdroid-store",
 ]
 
 [[package]]
 name = "purrdroid-rfb"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "purrdroid-store"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "argon2",
  "blake2",
