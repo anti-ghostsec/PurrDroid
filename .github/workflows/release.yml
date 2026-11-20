@@ -5,26 +5,27 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
-  # Signed build provenance (see "Attest" below).
-  id-token: write
-  attestations: write
+# Nothing by default: each job gets only what it needs. The tests (which
+# build and run every dependency's code) run in a job that can't write to
+# the repository or sign anything.
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
 
 # Actions are pinned by commit: a tag can be moved to point at other code.
 jobs:
-  linux-x86_64:
+  test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
-          targets: x86_64-unknown-linux-musl
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       # The release says which version it is: the tag and Cargo.toml agree.
       - name: Check the version
@@ -35,6 +36,22 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked --release
+
+  linux-x86_64:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Signed build provenance (see "Attest" below).
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       # Static (musl): one file that runs on any x86_64 Linux.
       - name: Build
