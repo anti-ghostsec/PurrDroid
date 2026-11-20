@@ -350,9 +350,23 @@ impl Vault {
         let pending = pending_path(path);
         let salt: [u8; SALT] = bytes[..SALT].try_into().unwrap();
         let key = derive(password, keyfiles, &salt)?;
+        // A save cut short: the new contents were written and synced beside
+        // the vault before the vault itself was touched, and are removed
+        // only once it's whole, so when they're there they are the newest.
+        // They come first: a half-written vault can still open this slot
+        // with the old contents when the slot is in the half not yet
+        // rewritten, and the save would be lost.
+        if let Ok(new) = read_file(&pending) {
+            let new_salt: [u8; SALT] = new[..SALT].try_into().unwrap();
+            let new_key = if new_salt == salt { key.clone() } else { derive(password, keyfiles, &new_salt)? };
+            if let Some(v) = Self::open_slot(path, &new, new_key)? {
+                write_vault(path, &new)?;
+                return Ok(v);
+            }
+        }
         if let Some(v) = Self::open_slot(path, &bytes, key.clone())? {
-            // A save that was cut short after the vault was written: what
-            // waited beside it isn't needed.
+            // Whatever waited beside it (cut short while being written, or
+            // while being wiped) isn't needed.
             if pending.exists() {
                 scrub_file(&pending);
             }
@@ -361,16 +375,6 @@ impl Vault {
         if constant_eq(&duress_check(&key), &bytes[SALT..HEAD]) {
             destroy_file(path);
             return Err(Error::WrongPassword);
-        }
-        // A save cut short while the vault itself was being written (or
-        // before): the new contents are beside it, whole. Finished now.
-        if let Ok(new) = read_file(&pending) {
-            let new_salt: [u8; SALT] = new[..SALT].try_into().unwrap();
-            let key = if new_salt == salt { key } else { derive(password, keyfiles, &new_salt)? };
-            if let Some(v) = Self::open_slot(path, &new, key)? {
-                write_vault(path, &new)?;
-                return Ok(v);
-            }
         }
         Err(Error::WrongPassword)
     }
@@ -543,25 +547,37 @@ mod tests {
         drop(v);
 
         // Cut short with the new contents beside it and the vault not yet
-        // written (or half written): the new password opens it, and the
-        // save is finished.
+        // written, or written only up to some point: the new password opens
+        // it, and the save is finished, wherever this password's slot is
+        // (in the part already rewritten or not).
         let mut v = Vault::unlock(&p, b"pw2", None).unwrap();
         let old = fs::read(&p).unwrap();
         v.settings.set("b", "2");
         v.save().unwrap();
         let new = fs::read(&p).unwrap();
+        drop(v);
+        for cut in [0, HEAD + SLOT_LEN, HEAD + 2 * SLOT_LEN, HEAD + 3 * SLOT_LEN, FILE_LEN - 1] {
+            fs::write(pending_path(&p), &new).unwrap();
+            let mut torn = old.clone();
+            torn[..cut].copy_from_slice(&new[..cut]);
+            let f = fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.write_all_at(&torn, 0).unwrap();
+            drop(f);
+            let v = Vault::unlock(&p, b"pw2", None).unwrap();
+            assert_eq!(v.settings.get("b"), Some("2"), "cut at {cut}");
+            assert_eq!(fs::read(&p).unwrap(), new);
+            assert!(!pending_path(&p).exists(), "finished and wiped");
+        }
+        // Cut short after the vault was written: what's beside it is the
+        // same, and is dropped.
         fs::write(pending_path(&p), &new).unwrap();
-        let mut torn = old.clone();
-        torn[HEAD..HEAD + FILE_LEN / 2].copy_from_slice(&new[HEAD..HEAD + FILE_LEN / 2]);
-        let f = fs::OpenOptions::new().write(true).open(&p).unwrap();
-        f.write_all_at(&torn, 0).unwrap();
-        drop(f);
-        let v = Vault::unlock(&p, b"pw2", None).unwrap();
-        assert_eq!(v.settings.get("b"), Some("2"));
-        assert_eq!(fs::read(&p).unwrap(), new);
-        assert!(!pending_path(&p).exists(), "finished and wiped");
-        // And when the vault was written already, what's beside it is dropped.
-        fs::write(pending_path(&p), &old).unwrap();
+        assert_eq!(Vault::unlock(&p, b"pw2", None).unwrap().settings.get("b"), Some("2"));
+        assert!(!pending_path(&p).exists());
+        // Cut short while what's beside it was being wiped: it no longer
+        // opens, and the vault is used.
+        let mut half_wiped = new.clone();
+        half_wiped[..FILE_LEN - 1].fill(0x5a);
+        fs::write(pending_path(&p), &half_wiped).unwrap();
         assert_eq!(Vault::unlock(&p, b"pw2", None).unwrap().settings.get("b"), Some("2"));
         assert!(!pending_path(&p).exists());
         let _ = fs::remove_file(&p);
