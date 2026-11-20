@@ -7,3 +7,4 @@ description = "PurrDroid's NBD server: hands the encrypted disks to QEMU over a 
 
 [dependencies]
 purrdroid-store.workspace = true
+libc.workspace = true

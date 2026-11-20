@@ -1,10 +1,10 @@
-//! A small NBD server: hands PurrDroid's encrypted disks to QEMU over a Unix
-//! socket, so QEMU only ever sees decrypted sectors in memory and never
+//! A small NBD server: hands PurrDroid's encrypted disks to QEMU over Unix
+//! socket connections PurrDroid makes for it, so QEMU only ever sees decrypted sectors in memory and never
 //! touches the disk files (it isn't given the keys, or the files).
 //!
 //! It speaks the "fixed newstyle" handshake with `NBD_OPT_GO` (and the older
 //! `NBD_OPT_EXPORT_NAME`), and simple replies: read, write, flush, trim and
-//! write-zeroes. One connection per export, served on its own thread.
+//! write-zeroes. One connection per export.
 
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -65,20 +65,38 @@ const MAX_REQUEST: u32 = 32 << 20;
 pub type Export = Arc<Mutex<dyn BlockDev>>;
 pub type Exports = Arc<HashMap<String, Export>>;
 
-/// Serves `exports` on `listener` until the listener fails. Each connection
-/// gets its own thread. Any error on one connection only ends that one.
+/// Serves one connection that's already there (PurrDroid hands QEMU the
+/// other end of a socket pair, so there's nothing anyone else could connect
+/// to), until it's closed. An error ends only this connection.
+pub fn serve_stream(stream: UnixStream, exports: &Exports) {
+    if let Err(e) = handle(stream, exports) {
+        if e.kind() != io::ErrorKind::UnexpectedEof {
+            eprintln!("purrdroid: disk connection ended: {e}");
+        }
+    }
+}
+
+/// Serves `exports` on `listener` until the listener fails, for trying the
+/// server out (see the example): anything this user runs can connect to a
+/// listening socket, so PurrDroid itself never uses this. Connections from
+/// other users are refused. Each connection gets its own thread.
 pub fn serve(listener: UnixListener, exports: Exports) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { break };
+        if !same_user(&stream) {
+            continue;
+        }
         let exports = exports.clone();
-        thread::spawn(move || {
-            if let Err(e) = handle(stream, &exports) {
-                if e.kind() != io::ErrorKind::UnexpectedEof {
-                    eprintln!("purrdroid: disk connection ended: {e}");
-                }
-            }
-        });
+        thread::spawn(move || serve_stream(stream, &exports));
     }
+}
+
+fn same_user(s: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ok = unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut _ as *mut _, &mut len) } == 0;
+    ok && cred.uid == unsafe { libc::getuid() }
 }
 
 fn read_u16(r: &mut impl Read) -> io::Result<u16> {

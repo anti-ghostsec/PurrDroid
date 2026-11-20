@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -634,14 +634,12 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         v.save()?;
     }
     drop(android_key);
-    let socks = vm::sockets(&rt);
-    let _ = fs::remove_file(&socks.disk);
-    let listener = UnixListener::bind(&socks.disk)?;
-    let exports = Arc::new(exports);
-    {
-        let exports = exports.clone();
-        thread::spawn(move || purrdroid_nbd::serve(listener, exports));
+    // Sockets 0.1.3 left in the folder if it was killed: nothing listens
+    // on a path any more.
+    for old in ["disk.sock", "screen.sock", "qmp.sock"] {
+        let _ = fs::remove_file(rt.join(old));
     }
+    let exports = Arc::new(exports);
 
     let tor = if net == Net::Tor { Some(tor::start(&rt)?) } else { None };
     let adb_key = purrdroid_adb::Key::from_der(&unhex(v.settings.get("adb_key").ok_or("the vault has no adb key")?).ok_or("bad adb key")?)?;
@@ -659,13 +657,16 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         mac: v.settings.get("mac").unwrap_or("02:00:00:00:00:01").to_string(),
         serial: v.settings.get("serial").unwrap_or("0").to_string(),
         uuid: v.settings.get("uuid").unwrap_or("00000000-0000-4000-8000-000000000000").to_string(),
-        rt: rt.clone(),
         exe: std::env::current_exe()?,
         tor_socks: tor.as_ref().map(|t| t.socks.clone()),
     };
 
     eprintln!("purrdroid: starting Android ({} MiB, {} CPUs, network {})...", cfg.ram_mb, cfg.cpus, net.name());
-    let child = Arc::new(Mutex::new(vm::start(&mut cfg)?));
+    let vm::Vm { child, mut qmp } = vm::start(&mut cfg, &mut |conn| {
+        let exports = exports.clone();
+        thread::spawn(move || purrdroid_nbd::serve_stream(conn, &exports));
+    })?;
+    let child = Arc::new(Mutex::new(child));
     let vm_done = Arc::new(AtomicBool::new(false));
     let (wake_r, wake_w) = UnixStream::pair()?;
     wake_w.set_nonblocking(true)?;
@@ -687,15 +688,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         });
     }
 
-    let mut screen = None;
-    for _ in 0..100 {
-        if let Ok(s) = UnixStream::connect(&socks.screen) {
-            screen = Some(s);
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    let screen = screen.ok_or("QEMU's screen never came up")?;
+    let screen = qmp.screen().map_err(|e| format!("QEMU's screen never came up ({e})"))?;
     let windowless = args.iter().any(|a| a == "--no-window");
     let outbox = rt.join("outbox");
     // Files a session killed outright left in memory (this one holds the lock).
@@ -759,7 +752,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         let _ = bridge_tx.send(bridge::Request::PowerOff(tx));
         let asked = rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false);
         if !asked {
-            let _ = vm::qmp(&socks.qmp, "system_powerdown");
+            let _ = qmp.command("system_powerdown");
         }
         let deadline = Instant::now() + Duration::from_secs(45);
         while !vm_done.load(Ordering::Relaxed) && Instant::now() < deadline {
@@ -767,7 +760,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         }
         if !vm_done.load(Ordering::Relaxed) {
             eprintln!("purrdroid: Android didn't shut down; stopping it.");
-            let _ = vm::qmp(&socks.qmp, "quit");
+            let _ = qmp.command("quit");
             thread::sleep(Duration::from_secs(2));
             let _ = child.lock().unwrap().kill();
         }
@@ -782,9 +775,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
         }
     }
     drop(tor);
-    for p in [&socks.disk, &socks.screen, &socks.qmp, &rt.join("control.sock")] {
-        let _ = fs::remove_file(p);
-    }
+    let _ = fs::remove_file(rt.join("control.sock"));
     let _ = fs::remove_dir_all(&outbox);
     let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
     eprintln!("purrdroid: Android is off.");

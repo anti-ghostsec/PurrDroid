@@ -17,12 +17,12 @@ memory. Written in Rust.
  ┌──────────────────────────────────────────┐    ┌──────────────────────────┐
  │ purrdroid                                │    │ Android-x86 (BlissOS…)   │
  │  vault ── Argon2id → keys (in memory)    │    │                          │
- │  disks ── XChaCha20-Poly1305 per sector ─┼NBD─┤ virtio disk              │
- │  window ── VNC socket ──────────────────┼────┤ virtio GPU (virgl 3D)    │
+ │  disks ── XChaCha20-Poly1305 ───────────┼NBD─┤ virtio disk              │
+ │  window ── VNC (socket pair) ───────────┼────┤ virtio GPU (virgl 3D)    │
  │  bridge ── adb, PurrDroid's own key ────┼────┤ adbd (127.0.0.1 only)    │
  │  Tor mode ── tor, state in memory ──────┼────┤ HTTP proxy, nothing else │
  └──────────────────────────────────────────┘    └──────────────────────────┘
-   sockets, Tor, files on their way: $XDG_RUNTIME_DIR (tmpfs, refused otherwise)
+   Tor, the control socket, files on their way: $XDG_RUNTIME_DIR (tmpfs, refused otherwise)
 ```
 
 - **Android** is a normal Android-x86 build: [BlissOS](https://blissos.org)
@@ -31,6 +31,10 @@ memory. Written in Rust.
   there, and wiped once Android starts from its own disk. The ISO you
   downloaded stays where it was unless you have PurrDroid overwrite it
   (`import --remove`).
+- **QEMU's disks, screen and control** each come over a socket pair
+  PurrDroid makes and hands it already connected: there's no socket file
+  anywhere that another program could open to read the decrypted disk, see
+  the screen, type into Android, or tell QEMU to save its memory to a file.
 - **A virtual machine, not a container**, so Android's apps run against
   their own kernel and can't reach FerroOS's. QEMU itself runs with its
   seccomp sandbox on, gets no files and no keys, and dies with PurrDroid.
@@ -65,7 +69,7 @@ computer, quantum or not. The weak point is the password: pick a long one,
 or add a keyfile.
 
 Everything that isn't encrypted is in memory: the decrypted sectors (they
-go straight from PurrDroid to QEMU over a socket), Android's RAM (no swap
+go straight from PurrDroid to QEMU over a socket pair), Android's RAM (no swap
 file; PurrDroid and its keys can't be read by other programs or dumped),
 Tor's state, and files on their way in or out.
 
@@ -341,6 +345,13 @@ UUID and network address are random, made once per vault.
   a hidden setup's.
 - The window has no shared clipboard and can't change Android's screen
   size when resized (it scales instead).
+- Programs running as you can still do what `purrdroid send`, `apk` and
+  `shell` do, through PurrDroid's control socket (in its private folder in
+  memory, for your user only), and that includes running commands in
+  Android. And a program running as you that may trace others (with
+  `kernel.yama.ptrace_scope` at 0) can read QEMU's memory, which holds
+  Android's; most systems set it to 1, where only PurrDroid itself may.
+  PurrDroid is no defence against software already running as you.
 - The adb port is on 127.0.0.1: other programs on this PC can reach it, but
   without PurrDroid's key adbd gives them nothing.
 - Only x86-64 Linux with KVM. QEMU's 3D (virgl) needs a GPU render node;
