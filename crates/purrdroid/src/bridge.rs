@@ -95,13 +95,25 @@ impl Net {
 /// connections to it to `purrdroid relay`, which hands them to Tor).
 pub const TOR_PROXY: &str = "10.0.2.100:8118";
 
-pub fn start(port: u16, key: Key, net: Net, outbox: PathBuf, notes: Sender<Note>, wake: impl Fn() + Send + 'static) -> Sender<Request> {
+/// `airplane_was_ours`: PurrDroid switched airplane mode on for `--net off`
+/// in an earlier session (Android keeps it across restarts), and it's to be
+/// switched off again now that the network is wanted.
+pub fn start(
+    port: u16,
+    key: Key,
+    net: Net,
+    airplane_was_ours: bool,
+    outbox: PathBuf,
+    notes: Sender<Note>,
+    wake: impl Fn() + Send + 'static,
+) -> Sender<Request> {
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || run(port, key, net, outbox, rx, notes, wake));
+    thread::spawn(move || run(port, key, net, airplane_was_ours, outbox, rx, notes, wake));
     tx
 }
 
-fn run(port: u16, key: Key, net: Net, outbox: PathBuf, rx: Receiver<Request>, notes: Sender<Note>, wake: impl Fn()) {
+#[allow(clippy::too_many_arguments)]
+fn run(port: u16, key: Key, net: Net, airplane_was_ours: bool, outbox: PathBuf, rx: Receiver<Request>, notes: Sender<Note>, wake: impl Fn()) {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let note = |n: Note| {
         let _ = notes.send(n);
@@ -119,7 +131,7 @@ fn run(port: u16, key: Key, net: Net, outbox: PathBuf, rx: Receiver<Request>, no
             // A short wait for the Allow tap, then again on the next round:
             // requests in the meantime aren't held up for long.
             match Adb::connect(addr, &key, Duration::from_secs(10)) {
-                Ok(mut a) => match setup(&mut a, net) {
+                Ok(mut a) => match setup(&mut a, net, airplane_was_ours) {
                     Ok(()) => {
                         note(Note::Status("Connected to Android".into()));
                         adb = Some(a);
@@ -327,7 +339,7 @@ fn explain_install(said: &str) -> String {
 /// the emulator's is on already).
 pub const HOW_TO_CONNECT: &str = "Android isn't connected to PurrDroid yet. Switch it on once, in Android: Settings > About tablet, tap Build number 7 times; then Settings > System > Developer options, turn on USB debugging, and tap Allow when Android asks about PurrDroid's key.";
 
-fn setup(a: &mut Adb, net: Net) -> purrdroid_adb::Result<()> {
+fn setup(a: &mut Adb, net: Net, airplane_was_ours: bool) -> purrdroid_adb::Result<()> {
     a.shell(&format!("mkdir -p {} {}", quote(FROM_DIR), quote(TO_DIR)))?;
     // A virtual PC has no battery, so Android on it reads one at 0%: told
     // it's plugged in and full instead (until Android restarts).
@@ -336,8 +348,14 @@ fn setup(a: &mut Adb, net: Net) -> purrdroid_adb::Result<()> {
     // has no other way out, so an app that ignores it simply gets nowhere.
     let proxy = if net == Net::Tor { TOR_PROXY } else { ":0" };
     a.shell(&format!("settings put global http_proxy {proxy}"))?;
+    // Off: airplane mode, which Android keeps, so from the next start on
+    // its radios are off from the moment it boots (the first time, only
+    // from now: the emulator engine has no other way to cut its network;
+    // an ISO's virtual machine has no way out in off mode anyway).
     if net == Net::Off {
         a.shell("cmd connectivity airplane-mode enable")?;
+    } else if airplane_was_ours {
+        a.shell("cmd connectivity airplane-mode disable")?;
     }
     Ok(())
 }

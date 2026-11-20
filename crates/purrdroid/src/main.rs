@@ -487,6 +487,21 @@ fn setting_u32(v: &mut Vault, args: &[String], flag: &str, name: &str, default: 
     Ok(v.settings.get(name).and_then(|s| s.parse().ok()).unwrap_or(default))
 }
 
+/// Notes in the vault that PurrDroid switches Android's airplane mode on
+/// (`--net off`), and says whether it's to be switched off again (it was
+/// PurrDroid's doing and the network is wanted now).
+fn airplane(v: &mut Vault, net: Net) -> Res<bool> {
+    let ours = v.settings.get("airplane") == Some("purrdroid");
+    if net == Net::Off && !ours {
+        v.settings.set("airplane", "purrdroid");
+        v.save()?;
+    } else if net != Net::Off && ours {
+        v.settings.remove("airplane");
+        v.save()?;
+    }
+    Ok(net != Net::Off && ours)
+}
+
 /// Only one PurrDroid at a time: held while it runs.
 fn take_lock() -> Res<File> {
     let rt = paths::runtime_dir()?;
@@ -643,7 +658,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
     }
     let exports = Arc::new(exports);
 
-    let tor = if net == Net::Tor { Some(tor::start(&rt)?) } else { None };
+    let tor = if net == Net::Tor { Some(tor::start(&rt, v.settings.get("tor_guards"))?) } else { None };
     let adb_key = purrdroid_adb::Key::from_der(&unhex(v.settings.get("adb_key").ok_or("the vault has no adb key")?).ok_or("bad adb key")?)?;
     let mut cfg = vm::Config {
         ram_mb: ram,
@@ -664,7 +679,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
     };
 
     eprintln!("purrdroid: starting Android ({} MiB, {} CPUs, network {})...", cfg.ram_mb, cfg.cpus, net.name());
-    let vm::Vm { child, mut qmp } = vm::start(&mut cfg, &mut |conn| {
+    let vm::Vm { child, mut qmp, net: net_helper } = vm::start(&mut cfg, &mut |conn| {
         let exports = exports.clone();
         thread::spawn(move || purrdroid_nbd::serve_stream(conn, &exports));
     })?;
@@ -697,7 +712,7 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
     let _ = fs::remove_dir_all(&outbox);
     let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
     let (notes_tx, notes_rx) = mpsc::channel();
-    let bridge_tx = bridge::start(cfg.adb_port, adb_key, net, outbox.clone(), notes_tx, waker.clone());
+    let bridge_tx = bridge::start(cfg.adb_port, adb_key, net, airplane(v, net)?, outbox.clone(), notes_tx, waker.clone());
     bridge::serve_control(rt.join("control.sock"), bridge_tx.clone())?;
 
     let end = if windowless {
@@ -776,7 +791,15 @@ fn run_unlocked(args: &[String], v: &mut Vault, install: bool) -> Res<()> {
             eprintln!("purrdroid: couldn't save the container: {e}");
         }
     }
-    drop(tor);
+    drop(net_helper);
+    if let Some(guards) = tor.and_then(tor::Tor::finish) {
+        if v.settings.get("tor_guards") != Some(guards.as_str()) {
+            v.settings.set("tor_guards", &guards);
+            if let Err(e) = v.save() {
+                eprintln!("purrdroid: couldn't keep Tor's guards: {e}");
+            }
+        }
+    }
     let _ = fs::remove_file(rt.join("control.sock"));
     let _ = fs::remove_dir_all(&outbox);
     let _ = fs::remove_dir_all(bridge::big_outbox(&outbox));
@@ -975,7 +998,7 @@ fn run_emulator(args: &[String], v: &mut Vault, files: &paths::Files, ram: u32, 
     let (notes_tx, notes_rx) = mpsc::channel();
     let mut notes_rx = Some(notes_rx);
     let clip_tx = notes_tx.clone();
-    let bridge_tx = bridge::start(console + 1, adb_key, net, outbox.clone(), notes_tx, || {});
+    let bridge_tx = bridge::start(console + 1, adb_key, net, airplane(v, net)?, outbox.clone(), notes_tx, || {});
     bridge::serve_control(rt.join("control.sock"), bridge_tx.clone())?;
     unsafe {
         libc::signal(libc::SIGINT, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);

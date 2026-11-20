@@ -67,6 +67,8 @@ struct Passed {
     config: Option<RawFd>,
     /// A file in memory holding [`smbios_table`].
     smbios: RawFd,
+    /// Direct mode through passt: QEMU's end of the connection to it.
+    passt: Option<RawFd>,
 }
 
 /// The SMBIOS "system" table (type 1) Android reads its serial number and
@@ -115,7 +117,7 @@ fn memory_file(bytes: &[u8]) -> io::Result<std::os::fd::OwnedFd> {
 /// The network card (its address tells this Android apart) and the
 /// network (which in Tor mode names PurrDroid's folder and program), in
 /// QEMU's configuration file format.
-fn identity_config(c: &Config) -> io::Result<String> {
+fn identity_config(c: &Config, passt: bool) -> io::Result<String> {
     let mut out = String::new();
     let mut group = |name: &str, entries: &[(&str, &str)]| -> io::Result<()> {
         out.push_str(name);
@@ -129,15 +131,19 @@ fn identity_config(c: &Config) -> io::Result<String> {
         out.push('\n');
         Ok(())
     };
-    let (hostfwd, guestfwd) = slirp_forwards(c);
-    let mut net = vec![("type", "user"), ("ipv6", "off"), ("hostfwd", hostfwd.as_str())];
-    if c.net != Net::Direct {
-        net.push(("restrict", "on"));
+    // passt's network is on the command line (QEMU takes it no other way);
+    // it holds nothing that tells this Android apart.
+    if !passt {
+        let (hostfwd, guestfwd) = slirp_forwards(c);
+        let mut net = vec![("type", "user"), ("ipv6", "off"), ("hostfwd", hostfwd.as_str())];
+        if c.net != Net::Direct {
+            net.push(("restrict", "on"));
+        }
+        if let Some(g) = &guestfwd {
+            net.push(("guestfwd", g.as_str()));
+        }
+        group("[netdev \"net0\"]", &net)?;
     }
-    if let Some(g) = &guestfwd {
-        net.push(("guestfwd", g.as_str()));
-    }
-    group("[netdev \"net0\"]", &net)?;
     // romfile empty: no network boot firmware, nothing to boot from there.
     group("[device \"nic\"]", &[("driver", "virtio-net-pci"), ("netdev", "net0"), ("mac", &c.mac), ("romfile", "")])?;
     Ok(out)
@@ -145,6 +151,12 @@ fn identity_config(c: &Config) -> io::Result<String> {
 
 /// The user-mode network's forwards: adb's port in from 127.0.0.1 only,
 /// and in Tor mode the relay out.
+///
+/// QEMU's user-mode network, unrestricted (direct mode without passt),
+/// also takes the guest's connections to 10.0.2.2 to this PC's own
+/// 127.0.0.1, where local services listen that were never meant for
+/// Android; with `restrict=on` (off and Tor modes) the guest can't reach
+/// anything but the forwards.
 fn slirp_forwards(c: &Config) -> (String, Option<String>) {
     let hostfwd = format!("tcp:127.0.0.1:{}-:5555", c.adb_port);
     let guestfwd = (c.net == Net::Tor).then(|| {
@@ -165,6 +177,81 @@ fn config_pipe(text: &str) -> io::Result<std::os::fd::OwnedFd> {
     // A few hundred bytes: far less than a pipe holds, so this never waits.
     io::Write::write_all(&mut std::fs::File::from(w), text.as_bytes())?;
     Ok(r)
+}
+
+/// Direct mode's way out when passt is installed (and this QEMU can use
+/// it): the same internet as QEMU's own user-mode network, without the way
+/// back into this PC. passt is told not to map the gateway address to the
+/// host (`--no-map-gw`), so 10.0.2.2 is nobody. Returns the name servers
+/// Android is to be given, or `None` if passt can't be used here.
+/// `PURRDROID_SLIRP=1` uses QEMU's own network instead.
+pub fn passt_plan() -> Option<Vec<String>> {
+    if std::env::var_os("PURRDROID_SLIRP").is_some() {
+        return None;
+    }
+    let help = Command::new("passt").arg("--help").stdin(Stdio::null()).output().ok()?;
+    let help = format!("{}{}", String::from_utf8_lossy(&help.stdout), String::from_utf8_lossy(&help.stderr));
+    if !help.contains("--fd") || !help.contains("--no-map-gw") {
+        return None;
+    }
+    let q = Command::new("qemu-system-x86_64").args(["-netdev", "help"]).stdin(Stdio::null()).output().ok()?;
+    if !String::from_utf8_lossy(&q.stdout).lines().any(|l| l.trim() == "stream") {
+        return None;
+    }
+    // With the gateway not mapped, a name server on this PC's loopback (a
+    // local resolver) can't be reached: the ones it asks, then.
+    let servers = |path: &str| -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("nameserver"))
+            .filter_map(|a| a.trim().parse::<std::net::Ipv4Addr>().ok())
+            .filter(|a| !a.is_loopback() && !a.is_unspecified())
+            .map(|a| a.to_string())
+            .take(3)
+            .collect()
+    };
+    let mut dns = servers("/etc/resolv.conf");
+    if dns.is_empty() {
+        dns = servers("/run/systemd/resolve/resolv.conf");
+    }
+    (!dns.is_empty()).then_some(dns)
+}
+
+/// A process stopped when this is dropped.
+pub struct Helper(Child);
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Starts passt on `fd` (its end of the connection to QEMU): IPv4 only,
+/// Android at 10.0.2.15 behind a gateway at 10.0.2.2 as with QEMU's own
+/// network (and its gateway's hardware address, not this PC's), adb's port
+/// forwarded in from 127.0.0.1 only, nothing else in.
+fn spawn_passt(fd: RawFd, adb_port: u16, dns: &[String]) -> io::Result<Child> {
+    let mut p = Command::new("passt");
+    p.args(["--foreground", "--quiet", "--ipv4-only", "--no-map-gw", "-u", "none"]);
+    p.args(["-a", "10.0.2.15", "-n", "24", "-g", "10.0.2.2", "-M", "52:55:0a:00:02:02"]);
+    p.arg("-t").arg(format!("127.0.0.1/{adb_port}:5555"));
+    for d in dns {
+        p.arg("-D").arg(d);
+    }
+    p.arg("--fd").arg(fd.to_string());
+    p.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    unsafe {
+        p.pre_exec(move || {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    p.spawn()
 }
 
 fn render_node() -> Option<PathBuf> {
@@ -246,6 +333,9 @@ fn command(c: &Config, fds: &Passed) -> Command {
     // direct mode; only Tor's relay in Tor mode; nothing more in off mode.
     // In the configuration from the pipe (see identity_config), unless
     // QEMU wouldn't take it that way.
+    if let Some(fd) = fds.passt {
+        q.arg("-netdev").arg(format!("stream,id=net0,server=off,addr.type=fd,addr.str={fd}"));
+    }
     if fds.config.is_none() {
         let (hostfwd, guestfwd) = slirp_forwards(c);
         let mut net = format!("user,id=net0,ipv6=off,hostfwd={hostfwd}");
@@ -255,12 +345,14 @@ fn command(c: &Config, fds: &Passed) -> Command {
         if let Some(g) = guestfwd {
             net.push_str(&format!(",guestfwd={g}"));
         }
-        q.arg("-netdev").arg(net);
+        if fds.passt.is_none() {
+            q.arg("-netdev").arg(net);
+        }
         q.arg("-device").arg(format!("virtio-net-pci,netdev=net0,mac={},romfile=", c.mac));
     }
 
     q.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-    let keep: Vec<RawFd> = [Some(fds.qmp), Some(fds.android), fds.media, fds.config, Some(fds.smbios)].into_iter().flatten().collect();
+    let keep: Vec<RawFd> = [Some(fds.qmp), Some(fds.android), fds.media, fds.config, Some(fds.smbios), fds.passt].into_iter().flatten().collect();
     unsafe {
         q.pre_exec(move || {
             // Gone with PurrDroid, whatever happens to it.
@@ -281,6 +373,8 @@ fn command(c: &Config, fds: &Passed) -> Command {
 pub struct Vm {
     pub child: Child,
     pub qmp: Qmp,
+    /// passt, in direct mode when it's used: stopped when dropped.
+    pub net: Option<Helper>,
 }
 
 /// Starts QEMU. If it quits at once (no sound server, or no 3D on this
@@ -290,6 +384,10 @@ pub struct Vm {
 pub fn start(c: &mut Config, serve: &mut dyn FnMut(UnixStream)) -> io::Result<Vm> {
     let mut last = String::new();
     let mut by_pipe = true;
+    let mut passt = if c.net == Net::Direct { passt_plan() } else { None };
+    if c.net == Net::Direct && passt.is_none() {
+        eprintln!("purrdroid: passt isn't installed (or can't be used here), so in direct mode Android can reach services listening on this PC's 127.0.0.1, at 10.0.2.2; install passt to close that");
+    }
     let mut attempt = 0;
     while attempt < 3 {
         if attempt == 1 {
@@ -304,7 +402,24 @@ pub fn start(c: &mut Config, serve: &mut dyn FnMut(UnixStream)) -> io::Result<Vm
         let (qmp_ours, qmp_theirs) = UnixStream::pair()?;
         let (disk_ours, disk_theirs) = UnixStream::pair()?;
         let media = if c.install { Some(UnixStream::pair()?) } else { None };
-        let config = if by_pipe { Some(config_pipe(&identity_config(c)?)?) } else { None };
+        let net = match &passt {
+            Some(dns) => {
+                let (qemu_end, passt_end) = UnixStream::pair()?;
+                let helper = spawn_passt(passt_end.as_raw_fd(), c.adb_port, dns).map(Helper);
+                drop(passt_end);
+                std::thread::sleep(Duration::from_millis(300));
+                match helper.and_then(|mut h| if h.0.try_wait()?.is_none() { Ok(h) } else { Err(io::Error::other("passt quit")) }) {
+                    Ok(h) => Some((qemu_end, h)),
+                    Err(_) => {
+                        eprintln!("purrdroid: passt wouldn't start; using QEMU's own network (Android can reach this PC's 127.0.0.1 at 10.0.2.2)");
+                        passt = None;
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let config = if by_pipe { Some(config_pipe(&identity_config(c, net.is_some())?)?) } else { None };
         let smbios = memory_file(&smbios_table(&c.serial, &c.uuid)?)?;
         let fds = Passed {
             qmp: qmp_theirs.as_raw_fd(),
@@ -312,10 +427,12 @@ pub fn start(c: &mut Config, serve: &mut dyn FnMut(UnixStream)) -> io::Result<Vm
             media: media.as_ref().map(|(_, t)| t.as_raw_fd()),
             config: config.as_ref().map(|f| f.as_raw_fd()),
             smbios: smbios.as_raw_fd(),
+            passt: net.as_ref().map(|(q, _)| q.as_raw_fd()),
         };
         let spawned = command(c, &fds).spawn();
         // QEMU has its own copies now (or none, if it didn't start).
         drop((qmp_theirs, disk_theirs, config, smbios));
+        let net = net.map(|(_qemu_end, helper)| helper);
         let media = media.map(|(ours, _theirs)| ours);
         let mut child = spawned.map_err(|e| io::Error::other(format!("couldn't start qemu-system-x86_64 ({e}); is QEMU installed?")))?;
         serve(disk_ours);
@@ -344,7 +461,7 @@ pub fn start(c: &mut Config, serve: &mut dyn FnMut(UnixStream)) -> io::Result<Vm
                         let _ = io::copy(&mut e, &mut io::stderr());
                     });
                 }
-                return Ok(Vm { child, qmp: Qmp::new(qmp_ours)? });
+                return Ok(Vm { child, qmp: Qmp::new(qmp_ours)?, net });
             }
             Some(_) => {
                 let mut err = String::new();
@@ -560,7 +677,7 @@ mod tests {
             exe: "/opt/pd/purrdroid".into(),
             tor_socks: Some("/run/user/1000/purrdroid/tor/socks.sock".into()),
         };
-        let fds = Passed { qmp: 10, android: 11, media: None, config: Some(12), smbios: 13 };
+        let fds = Passed { qmp: 10, android: 11, media: None, config: Some(12), smbios: 13, passt: None };
         let q = command(&c, &fds);
         let argv: Vec<String> = q.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         let all = argv.join(" ");
@@ -568,7 +685,7 @@ mod tests {
             assert!(!all.contains(secret), "{secret} is on the command line: {all}");
         }
         assert!(all.contains("-readconfig /dev/fd/12") && all.contains("-smbios file=/dev/fd/13"));
-        let conf = identity_config(&c).unwrap();
+        let conf = identity_config(&c, false).unwrap();
         assert!(conf.contains("mac = \"02:aa:bb:cc:dd:ee\"") && conf.contains("restrict = \"on\"") && conf.contains("relay /run/user/1000"));
         assert!(conf.contains("hostfwd = \"tcp:127.0.0.1:40000-:5555\""));
     }

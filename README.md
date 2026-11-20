@@ -20,7 +20,7 @@ memory. Written in Rust.
  │  disks ── XChaCha20-Poly1305 ───────────┼NBD─┤ virtio disk              │
  │  window ── VNC (socket pair) ───────────┼────┤ virtio GPU (virgl 3D)    │
  │  bridge ── adb, PurrDroid's own key ────┼────┤ adbd (127.0.0.1 only)    │
- │  Tor mode ── tor, state in memory ──────┼────┤ HTTP proxy, nothing else │
+ │  Tor mode ── tor, guards in the vault ──┼────┤ HTTP proxy, nothing else │
  └──────────────────────────────────────────┘    └──────────────────────────┘
    Tor, the control socket, files on their way: $XDG_RUNTIME_DIR (tmpfs, refused otherwise)
 ```
@@ -71,7 +71,8 @@ or add a keyfile.
 Everything that isn't encrypted is in memory: the decrypted sectors (they
 go straight from PurrDroid to QEMU over a socket pair), Android's RAM (no swap
 file; PurrDroid and its keys can't be read by other programs or dumped),
-Tor's state, and files on their way in or out.
+Tor's state (apart from its guards, which are kept sealed in the vault),
+and files on their way in or out.
 
 ### Keyfiles
 
@@ -283,8 +284,12 @@ into one drag, and never holds the window up.
   folder in memory) is how PurrDroid shows it; it may still look for its
   own updates. Google's emulator calls some GPU drivers (some of Intel's) unsafe
   and would draw in software; PurrDroid uses the GPU anyway (`--software-gpu`
-  goes back to software, slower). Tor mode isn't there yet for it
-  (`--net off` is: airplane mode).
+  goes back to software, slower). Tor mode isn't there yet for it.
+  `--net off` is Android's airplane mode, switched on over adb: the first
+  time, Android has the network until it has started and PurrDroid has
+  reached it; Android keeps airplane mode, so after that it starts with its
+  radios off (PurrDroid switches it off again when `--net` goes back to
+  `direct`).
 
 ## Using it
 
@@ -303,9 +308,26 @@ into one drag, and never holds the window up.
   click it for FerroOS's Share box. The **x** forgets it.
 - **Network:** `purrdroid --net direct` (the default), `--net tor` (every
   app through Tor; the machine has no other way out, so apps that don't
-  use Android's proxy just can't connect), or `--net off`. The choice is
-  remembered, like `--ram MB`, `--cpus N`, `--screen 1280x800`,
-  `--no-gpu` and `--no-sound`.
+  use Android's proxy just can't connect), or `--net off` (no way out at
+  all). The choice is remembered, like `--ram MB`, `--cpus N`,
+  `--screen 1280x800`, `--no-gpu` and `--no-sound`.
+  - *Direct* goes through [passt](https://passt.top) when it's installed
+    (`apt install passt`, `dnf install passt`), told not to take Android's
+    connections to its gateway (10.0.2.2) to this PC: Android reaches the
+    internet but not the services listening on this PC's 127.0.0.1 (a
+    database, a printer's page, another program's local API). Android is
+    told to ask the name servers this PC's resolver asks (from
+    `/etc/resolv.conf`, or systemd-resolved's list), since a resolver on
+    127.0.0.1 is out of its reach. Without passt it's QEMU's own network,
+    where 10.0.2.2 *is* this PC's 127.0.0.1; PurrDroid says so when it
+    starts. (`PURRDROID_SLIRP=1` chooses QEMU's own network anyway.)
+  - *Tor* gives each site its own circuits (the site's name is the SOCKS
+    user name, which Tor keeps apart), so one exit relay doesn't see an
+    app's traffic to many sites. Tor's guards, the few relays every circuit
+    starts at, are kept (sealed in the vault) from one session to the next,
+    as Tor intends; a new set every time would give the network many more
+    chances to pick a bad one. They're the same relays every session, which
+    is how Tor is meant to work.
 - **Closing the window** shuts Android down properly.
 
 - **Copy and paste:** Ctrl+V in PurrDroid's window pastes the desktop's
@@ -359,8 +381,11 @@ is.
   `kernel.yama.ptrace_scope` at 0) can read QEMU's memory, which holds
   Android's; most systems set it to 1, where only PurrDroid itself may.
   PurrDroid is no defence against software already running as you.
-- The adb port is on 127.0.0.1: other programs on this PC can reach it, but
-  without PurrDroid's key adbd gives them nothing.
+- The adb port is a TCP port on 127.0.0.1 (a random one each start): other
+  programs on this PC, other users' included, can reach it. Without
+  PurrDroid's key adbd gives them nothing, but on an ISO's Android they can
+  make it ask "Allow USB debugging?" for their own key: tap Allow only right
+  after you switched debugging on yourself, for PurrDroid's key.
 - Only x86-64 Linux with KVM. QEMU's 3D (virgl) needs a GPU render node;
   without one Android draws in software, slower.
 
