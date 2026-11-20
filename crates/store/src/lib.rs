@@ -57,7 +57,7 @@ pub fn memlock_limit() -> Option<u64> {
     if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut r) } != 0 {
         return Some(0);
     }
-    (r.rlim_cur != libc::RLIM_INFINITY).then_some(r.rlim_cur as u64)
+    (r.rlim_cur != libc::RLIM_INFINITY).then_some(r.rlim_cur)
 }
 
 /// The most PurrDroid itself ever holds at once (the vault's Argon2id, the

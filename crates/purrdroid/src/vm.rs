@@ -664,7 +664,7 @@ mod tests {
         let t = smbios_table("0123ABCD", "00112233-4455-4677-8899-aabbccddeeff").unwrap();
         assert_eq!(&t[..8], &[1, 27, 0, 1, 1, 2, 0, 3]);
         assert_eq!(&t[8..24], &[0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x46, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
-        assert_eq!(&t[27..], b"QEMU\0Standard PC (Q35 + ICH9, 2009)\00123ABCD\0\0");
+        assert_eq!(&t[27..], b"QEMU\x00Standard PC (Q35 + ICH9, 2009)\x000123ABCD\x00\x00");
         assert!(smbios_table("x", "not a uuid").is_err());
         let (_, _, uuid) = random_identity().unwrap();
         assert!(smbios_table("x", &uuid).is_ok());

@@ -1323,11 +1323,9 @@ fn gui_main() -> Res<()> {
                 let key = v.settings.new_key("android_key")?;
                 v.settings.set("disk", "container");
                 v.save()?;
-                let made = gui::working(
-                    "PurrDroid",
-                    &format!("Filling Android's {DEFAULT_GIB} GiB disk with random bytes, once..."),
-                    |p| make_container(&f.android, DEFAULT_GIB << 30, &[&key], p).map_err(|e| e.to_string()),
-                )
+                let made = gui::working("PurrDroid", &format!("Filling Android's {DEFAULT_GIB} GiB disk with random bytes, once..."), |p| {
+                    make_container(&f.android, DEFAULT_GIB << 30, &[&key], p).map_err(|e| e.to_string())
+                })
                 .and_then(|r| r.map_err(Into::into));
                 if let Err(e) = made {
                     v.destroy();
